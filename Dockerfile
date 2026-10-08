@@ -17,16 +17,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# On x86_64 (Render, most CI) geopandas / fiona / pyproj / shapely install from manylinux wheels that
-# bundle GDAL, GEOS and PROJ, so nothing extra is needed. Fiona publishes no Linux arm64 wheels, so on
-# aarch64 (Docker on Apple Silicon) it is compiled against the system GDAL instead.
-COPY requirements.txt .
-RUN if [ "$(uname -m)" = "aarch64" ]; then \
-        apt-get update \
-        && apt-get install -y --no-install-recommends build-essential libgdal-dev gdal-bin \
-        && rm -rf /var/lib/apt/lists/*; \
+# System libraries. python:3.12-slim does not ship libexpat, which the GDAL bundled inside the Fiona
+# wheel links against (without it: "ImportError: libexpat.so.1: cannot open shared object file").
+# Everything else GDAL needs (PROJ, GEOS, curl, sqlite, ...) is bundled in the manylinux wheels.
+# Fiona publishes no Linux arm64 wheels, so on aarch64 (Docker on Apple Silicon) it is compiled
+# against the system GDAL instead, which needs the build toolchain and GDAL headers as well.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libexpat1 \
+    && if [ "$(uname -m)" = "aarch64" ]; then \
+        apt-get install -y --no-install-recommends build-essential libgdal-dev gdal-bin; \
     fi \
-    && pip install -r requirements.txt
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
 COPY app ./app
 COPY --from=frontend /frontend/dist ./frontend/dist
