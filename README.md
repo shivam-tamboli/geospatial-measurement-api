@@ -8,7 +8,7 @@ Repository: <https://github.com/shivam-tamboli/geospatial-measurement-api>
 
 <https://geospatial-measurement-api-zthu.onrender.com>
 
-The web UI is at that address, and the interactive API documentation is at `/docs` on the same host. The deployment runs on Render's free tier, so it spins down when idle and the first request after a pause is slow.
+The web UI is at that address, and the interactive API documentation is at `/docs` on the same host. `render.yaml` configures it for Render's free plan, where a service spins down when idle, so the first request after a pause can be slow.
 
 ## Running it locally
 
@@ -18,7 +18,7 @@ The web UI is at that address, and the interactive API documentation is at `/doc
 docker compose up --build
 ```
 
-That starts PostgreSQL 16 and the app, and opens everything on <http://localhost:8000>: the web UI at `/`, Swagger at `/docs`, a health probe at `/health`. The Dockerfile has two stages. Node builds the frontend, and the Python image copies the result in, so there is one container to run and nothing else to build. Postgres data and uploaded files live in named volumes; `docker compose down -v` deletes both.
+That starts PostgreSQL 16 and the app, and opens everything on <http://localhost:8000>: the web UI at `/`, Swagger at `/docs`, a health probe at `/health`. The Dockerfile has two stages. Node builds the frontend, and the Python image copies the result in, so the app is a single container (next to the database) and there is nothing else to build. Postgres data and uploaded files live in named volumes; `docker compose down -v` deletes both.
 
 Tables are created with `create_all` at startup, which never alters an existing table. If you pull a version that adds a column, recreate the volumes with `docker compose down -v` first.
 
@@ -71,7 +71,7 @@ Everything comes from environment variables, loaded from `.env` by python-dotenv
 - `LOG_LEVEL` (default `INFO`) and `LOG_FORMAT` (default `json`; use `console` for readable local output).
 - `DB_POOL_SIZE` (default 5) and `DB_MAX_OVERFLOW` (default 10): connection pool sizing.
 - `UPLOAD_DIR` (default `uploads`): where raw uploads are stored, under a UUID filename.
-- `MAX_UPLOAD_SIZE_MB` (default 50): the upload limit. A request whose `Content-Length` is over it is refused before the body is read; chunked requests are checked while streaming.
+- `MAX_UPLOAD_SIZE_MB` (default 50): the upload limit. A request whose `Content-Length` is over it (plus a 64 KB allowance for multipart framing) is refused before the body is read; chunked requests are checked while streaming.
 - `MAX_EXTRACTED_SIZE_MB` (default 500) and `MAX_ZIP_MEMBERS` (default 200): zip-bomb limits applied while extracting a Shapefile archive.
 - `DEFAULT_PAGE_SIZE` (default 50) and `MAX_PAGE_SIZE` (default 500): pagination for measurements.
 - `LIST_DEFAULT_PAGE_SIZE` (default 20) and `LIST_MAX_PAGE_SIZE` (default 100): pagination for the file listing.
@@ -83,7 +83,7 @@ Everything comes from environment variables, loaded from `.env` by python-dotenv
 
 ## API
 
-All endpoints are under `/api/files/`. The trailing slashes matter: without one, FastAPI answers with a 307 redirect, and some HTTP clients drop the request body when they follow it on a POST. The examples below are captured from a running instance.
+All endpoints are under `/api/files/`. The trailing slashes matter. Without one the request matches no route: you get `404 NOT_FOUND` from any instance that serves the frontend (the Docker image and the Render deployment), and a 307 redirect only from an API-only instance run without `frontend/dist`. I did not add a redirect, because some HTTP clients drop the body of a POST when they follow one. The examples below are captured from a running instance.
 
 Every error, from any endpoint, has the same shape: `{"detail": "...", "code": "..."}`. `detail` is for people; branch on `code`.
 
@@ -205,7 +205,7 @@ curl "http://localhost:8000/api/files/8e4bcba8-dfcc-4609-b116-718620bb14b3/measu
 }
 ```
 
-`geometry` is the WKT exactly as read from the file, in the file's own CRS. `geometry_geojson` is the same geometry reprojected to WGS84 as 2D GeoJSON, rounded to six decimals (about 10 cm), because a web map needs lon/lat and the original CRS could be anything. It is null only for a feature that had no geometry. `measurement.projected_crs` records which UTM zone the value was computed in. A point, or a geometry type I don't measure, gets a measurement whose fields are all null rather than an error.
+`geometry` is the WKT exactly as read from the file, in the file's own CRS. `geometry_geojson` is the same geometry reprojected to WGS84 as 2D GeoJSON, rounded to six decimals (about 10 cm), because a web map needs lon/lat and the original CRS could be anything. It is null only when the feature has no geometry or it could not be reprojected to valid WGS84 coordinates. `measurement.projected_crs` records which UTM zone the value was computed in. A point, or a geometry type I don't measure, gets a measurement whose fields are all null rather than an error.
 
 Calling this before processing finishes is `409 FILE_NOT_READY`. For a failed file it is `422 FILE_PROCESSING_FAILED`, with the reason in `detail`.
 
@@ -219,9 +219,9 @@ A Postman collection is included at postman_collection.json — import it, set b
 
 ### Structure
 
-The rule I held to is that route handlers contain no logic. `app/api/routes/files.py` declares parameters and OpenAPI metadata and makes one call into `app/services/file_service.py`. That module is the only place that touches both the database and the geospatial code. It stores uploads, runs the background job, and builds the response schemas.
+The rule I held to is that route handlers contain no logic. `app/api/routes/files.py` declares parameters and OpenAPI metadata and calls into `app/services/file_service.py`; the only thing a route does besides that is hand the upload's id to `BackgroundTasks`. `file_service` is the only place that touches both the database and the geospatial code. It stores uploads, runs the background job, and builds the response schemas.
 
-The geospatial code sits below it in three modules that know nothing about HTTP or SQL, which is what makes them easy to test with plain Shapely objects. `file_parser.py` turns a ZIP or KML into feature records. `crs_handler.py` owns every CRS decision: labels, UTM zone selection, reprojection. `measurement.py` computes areas and lengths and only ever gets geometries through `crs_handler`, so there is no code path that measures in degrees by accident.
+The geospatial code sits below it in three modules that never touch the database or a request object, which is what makes them easy to test with plain Shapely objects. (`file_parser` does raise the shared error classes, which carry an HTTP status; that is the one place the layers meet.) `file_parser.py` turns a ZIP or KML into feature records. `crs_handler.py` owns every CRS decision: labels, UTM zone selection, reprojection. `measurement.py` computes areas and lengths and only ever gets geometries through `crs_handler`, so there is no code path that measures in degrees by accident.
 
 Cross-cutting pieces live in `app/core/`: settings (`config.py`), JSON logging with a per-request id (`logging.py`), the error classes and handlers that produce the `{"detail", "code"}` shape (`exceptions.py`), the Content-Length guard (`middleware.py`), and the static-file mount that serves the frontend (`static.py`). The frontend is in `frontend/`: a typed fetch client, one hook per API call, and small components.
 
@@ -254,13 +254,26 @@ The job never raises. Domain errors become a `FAILED` status with their own mess
 
 The cost of in-process tasks is that a job dies with the process. To keep that from leaving a file in `PROCESSING` forever, startup marks every `PENDING` or `PROCESSING` file as `FAILED` with "Service restarted before processing completed". There is no age threshold, since any such job at startup can only belong to the previous process. That is only correct with one running instance; see the limitations.
 
+### How a geometry is measured
+
+`measure_geometries` in `measurement.py` decides per feature, by Shapely geometry type:
+
+- `Polygon` and `MultiPolygon` get an **area** in m². Holes are subtracted and the parts of a multipolygon are summed.
+- `LineString` and `MultiLineString` get a **length** in m.
+- `Point` and `MultiPoint` get no measurement, silently, because that is expected. The measurement object is returned with every field null.
+- Anything else (`GeometryCollection`, `LinearRing`), and any feature with a missing or empty geometry, also gets null, but it is logged as a warning with the feature index and type, so you can find it.
+- A feature that can't be measured for another reason (it can't be reprojected, or the result isn't a finite number) gets null and an error log. The rest of the file is unaffected.
+- An invalid polygon, for example a self-intersecting ring, is still measured, with a warning in the log.
+
+For the features that are measured, the steps are: reproject every geometry to WGS84 in one call, take each centroid and work out its UTM zone, group the features by zone, reproject each group from its original CRS into that zone in one call, then read `area` or `length` off the projected geometries. The stored measurement is the type (`area` or `length`), the value, the unit and the UTM CRS that was used, next to the feature's original CRS. On the 30,000-feature benchmark described below, this took 0.49 s, against 2.43 s for the first version that reprojected feature by feature.
+
 ## CRS handling
 
 Geographic coordinates are angles. A degree of longitude is about 111 km at the equator and shrinks to nothing at the poles, so a polygon's area in "square degrees" is not a measurement of anything. Measuring means projecting first, so that coordinates are in metres on a flat plane.
 
 For each polygon or line I take the centroid of the feature in WGS84, work out its UTM zone (`floor((lon + 180) / 6) + 1`, EPSG 326xx in the northern hemisphere and 327xx in the southern), reproject the geometry to that zone, and measure there. Both CRSs are stored: `crs` is the original, `measurement.projected_crs` is the zone used. Beyond 84°N and 80°S, UTM isn't defined, so those features use the UPS polar projections (EPSG:32661 and 32761). Longitudes are wrapped, so ±180° land in zones 1 and 60 as they should.
 
-Zones are chosen per feature, not per file, so a file that spans several zones is measured near each feature's own central meridian. I reproject even when the file is already projected, because a projected CRS can be in feet (US State Plane, for example) and measuring "as is" would give the wrong unit with no error. A Shapefile with no `.prj` is rejected with a message asking for one, rather than assuming a CRS: a wrong guess produces plausible numbers that are simply wrong. KML is defined to be WGS84, so that is assumed when the driver reports nothing.
+Zones are chosen per feature, not per file, so a file that spans several zones is measured near each feature's own central meridian. I reproject even when the file is already projected, because a projected CRS can be in feet (US State Plane, for example) and measuring "as is" would give the wrong unit with no error. A Shapefile with no `.prj` is accepted at upload but ends as `FAILED` with a message asking for the `.prj`, rather than getting an assumed CRS: a wrong guess produces plausible numbers that are simply wrong. The cost is that a genuinely WGS84 Shapefile that someone exported without its `.prj` is refused too. KML is defined to be WGS84, so that is assumed when the driver reports nothing.
 
 The `crs` label is never a guess. It is `EPSG:<code>` only when PROJ identifies the CRS with 100% confidence and the registry definition equals the file's CRS. Otherwise it is `CUSTOM:` followed by the first 100 characters of the CRS's WKT. A `CUSTOM:` file is still measured correctly, because measurement uses the CRS object, not the label. PROJ's default behaviour is to accept a 70% match: a Transverse Mercator I wrote by hand, with a central meridian of 75° and the UTM scale factor, came back as `EPSG:32643`, which it is not. The label is what users see, so I would rather say "custom" than name the wrong CRS.
 

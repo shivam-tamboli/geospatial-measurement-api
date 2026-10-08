@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Geospatial Measurement API",
-    "description": "Upload a Shapefile (.zip) or KML file and get the area (m²) of every polygon and the length (m) of every line, measured after reprojecting to the UTM zone of each feature.\n\n**Setup:** the `base_url` variable points at the hosted deployment. Change it to `http://localhost:8000` to test a local instance. `file_id` is filled in automatically when you run an upload request.\n\n**Typical flow:** Health Check → Upload Shapefile or Upload KML → Get File Info (repeat until `COMPLETED`) → Get Measurements. The hosted service runs on a free tier and sleeps when idle, so the first request can take up to a minute.",
+    "description": "Upload a Shapefile (.zip) or KML file and get the area (m²) of every polygon and the length (m) of every line, measured after reprojecting to the UTM zone of each feature.\n\n**Setup:** the `base_url` variable points at the hosted deployment. Change it to `http://localhost:8000` to test a local instance. `file_id` is filled in automatically when you run an upload request.\n\n**Typical flow:** Health Check → Upload Shapefile or Upload KML → Get File Info (repeat until `COMPLETED`) → Get Measurements. If the hosted service has been idle it may need a moment to wake up, so the first request can be slow.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -31,7 +31,7 @@
             "health"
           ]
         },
-        "description": "Checks that the service is up and can reach its database (it runs `SELECT 1`).\n\n**What to set:** nothing. Run this first; on the hosted free tier it also wakes the service up.\n\n**What comes back:** `200` with the body below. If the database is unreachable you get `503` with `{\"detail\": \"Database unavailable\", \"code\": \"DB_UNAVAILABLE\"}`.\n\n**Example response (200):**\n\n```json\n{\n  \"status\": \"ok\"\n}\n```"
+        "description": "Checks that the service is up and can reach its database (it runs `SELECT 1`).\n\n**What to set:** nothing. Run this first; if the hosted service has been idle, it also wakes it up.\n\n**What comes back:** `200` with the body below. If the database is unreachable you get `503` with `{\"detail\": \"Database unavailable\", \"code\": \"DB_UNAVAILABLE\"}`.\n\n**Example response (200):**\n\n```json\n{\n  \"status\": \"ok\"\n}\n```"
       },
       "response": []
     },
@@ -174,7 +174,7 @@
             ""
           ]
         },
-        "description": "Returns a file's status and metadata. This is the request to repeat after an upload.\n\n**What to set:** the `file_id` collection variable (set automatically by the upload requests, or paste an id from List Files). The URL ends in a slash on purpose: without it the server answers with a redirect.\n\n**What comes back:** `200` with the status, which moves `PENDING` → `PROCESSING` → `COMPLETED` or `FAILED`. `feature_count` and `crs` are `null` until it completes. `error` explains a `FAILED` file. `warnings` lists parts of a `COMPLETED` file that were skipped. `crs` is `EPSG:<code>` only for an exact match, otherwise `CUSTOM:` followed by the start of its WKT. An unknown id gives `404 FILE_NOT_FOUND`; a malformed id gives `422 VALIDATION_ERROR`.\n\n**Example response (200):**\n\n```json\n{\n  \"id\": \"8e4bcba8-dfcc-4609-b116-718620bb14b3\",\n  \"filename\": \"survey.kml\",\n  \"feature_count\": 3,\n  \"crs\": \"EPSG:4326\",\n  \"status\": \"COMPLETED\",\n  \"error\": null,\n  \"warnings\": [],\n  \"file_size\": 557,\n  \"created_at\": \"2026-10-08T23:25:24.191828Z\",\n  \"updated_at\": \"2026-10-08T23:25:24Z\"\n}\n```"
+        "description": "Returns a file's status and metadata. This is the request to repeat after an upload.\n\n**What to set:** the `file_id` collection variable (set automatically by the upload requests, or paste an id from List Files). The URL ends in a slash on purpose: without it the request matches no route and you get `404 NOT_FOUND`.\n\n**What comes back:** `200` with the status, which moves `PENDING` → `PROCESSING` → `COMPLETED` or `FAILED`. `feature_count` and `crs` are `null` until it completes. `error` explains a `FAILED` file. `warnings` lists parts of a `COMPLETED` file that were skipped. `crs` is `EPSG:<code>` only for an exact match, otherwise `CUSTOM:` followed by the start of its WKT. An unknown id gives `404 FILE_NOT_FOUND`; a malformed id gives `422 VALIDATION_ERROR`.\n\n**Example response (200):**\n\n```json\n{\n  \"id\": \"8e4bcba8-dfcc-4609-b116-718620bb14b3\",\n  \"filename\": \"survey.kml\",\n  \"feature_count\": 3,\n  \"crs\": \"EPSG:4326\",\n  \"status\": \"COMPLETED\",\n  \"error\": null,\n  \"warnings\": [],\n  \"file_size\": 557,\n  \"created_at\": \"2026-10-08T23:25:24.191828Z\",\n  \"updated_at\": \"2026-10-08T23:25:24Z\"\n}\n```"
       },
       "response": []
     },
