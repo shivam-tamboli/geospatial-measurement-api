@@ -1,152 +1,115 @@
 # Geospatial Measurement API
 
-A FastAPI service that accepts a **Shapefile (`.zip`)** or **KML (`.kml`)**, extracts every feature, and returns
-**area (m²) for polygons** and **length (m) for lines** — always computed in a projected CRS, never in degrees.
+This service takes a Shapefile (a `.zip`) or a KML file, reads every feature in it, and tells you the area of each polygon in square metres and the length of each line in metres. Measurements are always made after reprojecting to a metric CRS, never in degrees. It is a FastAPI backend with PostgreSQL, plus a small React frontend (upload, status, results table, map) that the same server serves.
 
-- **Backend:** FastAPI + Uvicorn · PostgreSQL + async SQLAlchemy (asyncpg) · GeoPandas / Shapely / PyProj / Fiona · Pydantic v2
-- **Frontend:** React + TypeScript (Vite) · Tailwind CSS · TanStack Query · Leaflet — served by the API at `/`
-- **Processing:** upload returns immediately; parsing + measuring runs as a background task
-- **Deploy:** Docker (multi-stage, builds the frontend), Docker Compose, Render (`render.yaml`)
+Repository: <https://github.com/shivam-tamboli/geospatial-measurement-api>
 
----
+## Live URL
 
-## Table of contents
+<https://geospatial-measurement-api-zthu.onrender.com>
 
-1. [Local setup](#local-setup)
-2. [API](#api)
-3. [Architecture](#architecture)
-4. [CRS handling strategy](#crs-handling-strategy)
-5. [Frontend](#frontend)
-6. [Design decisions & alternatives](#design-decisions--alternatives)
-7. [Error handling](#error-handling)
-8. [Testing](#testing)
-9. [Deployment (Render)](#deployment-render)
-10. [Learnings & future scope](#learnings--future-scope)
+The web UI is at that address, and the interactive API documentation is at `/docs` on the same host. The deployment runs on Render's free tier, so it spins down when idle and the first request after a pause is slow.
 
----
+## Running it locally
 
-## Local setup
-
-### Option A — Docker Compose (recommended)
+### With Docker
 
 ```bash
-cp .env.example .env        # optional; sensible defaults are built in
 docker compose up --build
 ```
 
-Web app: <http://localhost:8000> · Interactive API docs: <http://localhost:8000/docs> · Health: <http://localhost:8000/health>
+That starts PostgreSQL 16 and the app, and opens everything on <http://localhost:8000>: the web UI at `/`, Swagger at `/docs`, a health probe at `/health`. The Dockerfile has two stages. Node builds the frontend, and the Python image copies the result in, so there is one container to run and nothing else to build. Postgres data and uploaded files live in named volumes; `docker compose down -v` deletes both.
 
-This starts PostgreSQL 16 and the API. The image is multi-stage: Node builds the React frontend, and the Python image
-serves it at `/` next to the API, so one container is the whole application. The API waits for the database healthcheck.
-Data persists in the `pgdata` and `uploads` volumes (`docker compose down -v` wipes them).
+Tables are created with `create_all` at startup, which never alters an existing table. If you pull a version that adds a column, recreate the volumes with `docker compose down -v` first.
 
-> **Schema changes:** tables are created with `create_all`, which never alters existing tables (there are no migrations
-> yet). After pulling a version that adds columns, recreate the database: `docker compose down -v && docker compose up --build`.
+### Without Docker
 
-> On Apple Silicon the image compiles Fiona against system GDAL (Fiona publishes no Linux arm64 wheels), so the
-> first build takes a couple of minutes. On x86_64 everything installs from wheels.
+You need Python 3.12 and a running PostgreSQL. Node 22 is only needed if you want the UI.
 
-### Option B — Without Docker
+1. Create the database and a virtualenv.
+   ```bash
+   createdb geospatial
+   python3.12 -m venv .venv && source .venv/bin/activate
+   pip install -r requirements-dev.txt     # requirements.txt if you don't need the tests
+   ```
+2. Copy the environment template and point `DATABASE_URL` at your database.
+   ```bash
+   cp .env.example .env
+   ```
+3. Start the API. Tables are created on startup.
+   ```bash
+   uvicorn app.main:app --reload
+   ```
+4. Optional, to serve the UI from the API: `cd frontend && npm ci && npm run build`. The API serves `frontend/dist` at `/` whenever that directory exists, and runs API-only when it doesn't.
 
-Requires Python 3.12 and a running PostgreSQL.
+To work on the frontend with hot reload, leave the API running on port 8000 and start Vite next to it:
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt      # use requirements.txt for runtime only
-
-createdb geospatial                      # or any database you like
-cp .env.example .env                     # then edit DATABASE_URL if needed
-
-uvicorn app.main:app --reload
+cd frontend
+npm ci
+npm run dev        # http://localhost:5173, calls http://localhost:8000 by default
 ```
 
-Tables are created automatically on startup. The API is at <http://localhost:8000>. If `frontend/dist` exists (see
-[Frontend](#frontend)) it is served at `/`; otherwise the app runs API-only.
+CORS is open (`*`) when `ENVIRONMENT=development`, so this works without configuration. In any other environment, set `ALLOWED_ORIGINS=http://localhost:5173`.
 
-### Configuration
+### Tests
 
-All settings come from environment variables (`.env` is loaded via `python-dotenv`). See [`.env.example`](.env.example).
+```bash
+pytest                      # 87 backend tests, no Postgres needed
+cd frontend && npm run build && npm run lint
+```
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `DATABASE_URL` | *(required)* | `postgresql+asyncpg://user:pass@host:5432/db`. `postgres://` / `postgresql://` are rewritten to the asyncpg driver automatically. |
-| `UPLOAD_DIR` | `uploads` | Where raw uploads are stored (as `<uuid>.<ext>`). |
-| `MAX_UPLOAD_SIZE_MB` | `50` | Upload limit (→ `413`). Rejected immediately from the `Content-Length` header, before the body is read; requests without that header (chunked) are checked while streaming. |
-| `MAX_EXTRACTED_SIZE_MB` / `MAX_ZIP_MEMBERS` | `500` / `200` | Zip-bomb guards. |
-| `DEFAULT_PAGE_SIZE` / `MAX_PAGE_SIZE` | `50` / `500` | Measurement pagination. |
-| `LIST_DEFAULT_PAGE_SIZE` / `LIST_MAX_PAGE_SIZE` | `20` / `100` | File-listing pagination. |
-| `ALLOWED_ORIGINS` | `*` in development, none otherwise | Comma-separated CORS origins, e.g. `http://localhost:5173,https://app.example.com`. |
-| `FRONTEND_DIST_DIR` | `frontend/dist` | Built frontend to serve at `/` (skipped if absent). |
-| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` | `json` for production, `console` for humans. |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `10` | Connection pool. |
+The backend tests run on SQLite, which is fast but means they cannot catch Postgres-specific problems. I found that out the hard way; see "What I learned". There are no automated frontend tests.
 
----
+## Configuration
+
+Everything comes from environment variables, loaded from `.env` by python-dotenv. Only `DATABASE_URL` is required. `postgres://` and `postgresql://` URLs are rewritten to the asyncpg driver, because that is what Render hands out.
+
+- `DATABASE_URL`: the PostgreSQL connection string.
+- `APP_NAME` (default `Geospatial Measurement API`): the title shown in the Swagger UI.
+- `ENVIRONMENT` (default `development`): `development` turns on permissive CORS by default.
+- `LOG_LEVEL` (default `INFO`) and `LOG_FORMAT` (default `json`; use `console` for readable local output).
+- `DB_POOL_SIZE` (default 5) and `DB_MAX_OVERFLOW` (default 10): connection pool sizing.
+- `UPLOAD_DIR` (default `uploads`): where raw uploads are stored, under a UUID filename.
+- `MAX_UPLOAD_SIZE_MB` (default 50): the upload limit. A request whose `Content-Length` is over it is refused before the body is read; chunked requests are checked while streaming.
+- `MAX_EXTRACTED_SIZE_MB` (default 500) and `MAX_ZIP_MEMBERS` (default 200): zip-bomb limits applied while extracting a Shapefile archive.
+- `DEFAULT_PAGE_SIZE` (default 50) and `MAX_PAGE_SIZE` (default 500): pagination for measurements.
+- `LIST_DEFAULT_PAGE_SIZE` (default 20) and `LIST_MAX_PAGE_SIZE` (default 100): pagination for the file listing.
+- `ALLOWED_ORIGINS`: comma-separated CORS origins. If unset, it is `*` in development and CORS is off otherwise.
+- `FRONTEND_DIST_DIR` (default `frontend/dist`): the built frontend to serve at `/`.
+- `PORT`: read by the Docker command; Render sets it. Defaults to 8000.
+- `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: used only by `docker-compose.yml` for the database container. The defaults are `postgres`, `postgres` and `geospatial`, so change them for anything shared.
+- `VITE_API_BASE_URL`: read at frontend build time. Unset means `http://localhost:8000` under `npm run dev` and the same origin in a production build.
 
 ## API
 
-Base path: `/api/files/`. Interactive OpenAPI docs are served at `/docs`.
+All endpoints are under `/api/files/`. The trailing slashes matter: without one, FastAPI answers with a 307 redirect, and some HTTP clients drop the request body when they follow it on a POST. The examples below are captured from a running instance.
 
-### `POST /api/files/` — upload
+Every error, from any endpoint, has the same shape: `{"detail": "...", "code": "..."}`. `detail` is for people; branch on `code`.
 
-Multipart upload, field name `file`. Accepts `.zip` (containing a Shapefile with `.shp/.shx/.dbf/.prj`) or `.kml`.
-Returns **202 Accepted** immediately; processing continues in the background.
+### POST /api/files/
 
-```bash
-curl -X POST http://localhost:8000/api/files/ -F "file=@survey.kml"
-```
-
-```json
-{
-  "id": "d518ba8f-66b0-491e-8c45-86af0a5acb53",
-  "filename": "survey.kml",
-  "status": "PENDING"
-}
-```
-
-### `GET /api/files/` — list uploads
-
-Newest first. Query params: `page` (default `1`), `page_size` (default `20`, max `100`).
+Uploads a file. The request is `multipart/form-data` with one field, `file`, which is either a `.zip` containing a Shapefile or a `.kml`. The response is `202 Accepted`, not 200, because nothing has been measured yet; parsing happens in the background.
 
 ```bash
-curl "http://localhost:8000/api/files/?page=1&page_size=2"
+curl -F "file=@survey.kml" http://localhost:8000/api/files/
 ```
-
 ```json
-{
-  "page": 1,
-  "page_size": 2,
-  "total": 2,
-  "total_pages": 1,
-  "items": [
-    {
-      "id": "212fd68c-6eee-4a1d-aa0e-50f03015646b",
-      "filename": "t.kml",
-      "status": "COMPLETED",
-      "feature_count": 3,
-      "crs": "EPSG:4326",
-      "created_at": "2026-10-08T22:39:27.425613Z"
-    },
-    {
-      "id": "0a70dc75-23a3-4f6f-a2cb-d6a67a8641ea",
-      "filename": "custom.zip",
-      "status": "COMPLETED",
-      "feature_count": 1,
-      "crs": "CUSTOM:PROJCRS[\"unknown\",BASEGEOGCRS[\"unknown\",DATUM[\"D_Unknown_based_on_WGS_84_ellipsoid\",ELLIPSOID[\"WGS 8",
-      "created_at": "2026-10-08T22:39:25.810029Z"
-    }
-  ]
-}
+{"id": "8e4bcba8-dfcc-4609-b116-718620bb14b3", "filename": "survey.kml", "status": "PENDING"}
 ```
 
-### `GET /api/files/{id}/` — file metadata
+Problems that can be seen without a full parse are rejected here: `400 INVALID_FILE_TYPE` (wrong extension, or content that doesn't match it), `400 EMPTY_FILE`, `413 FILE_TOO_LARGE`, and `422 CORRUPT_FILE` (not a valid ZIP, no `.shp` inside, no `<kml>` element). Anything that needs a real parse fails later, as a `FAILED` status.
+
+### GET /api/files/{id}/
+
+Returns the file's metadata and status. This is the endpoint to poll after an upload.
 
 ```bash
-curl http://localhost:8000/api/files/d518ba8f-66b0-491e-8c45-86af0a5acb53/
+curl http://localhost:8000/api/files/8e4bcba8-dfcc-4609-b116-718620bb14b3/
 ```
-
 ```json
 {
-  "id": "d518ba8f-66b0-491e-8c45-86af0a5acb53",
+  "id": "8e4bcba8-dfcc-4609-b116-718620bb14b3",
   "filename": "survey.kml",
   "feature_count": 3,
   "crs": "EPSG:4326",
@@ -154,39 +117,59 @@ curl http://localhost:8000/api/files/d518ba8f-66b0-491e-8c45-86af0a5acb53/
   "error": null,
   "warnings": [],
   "file_size": 557,
-  "created_at": "2026-10-08T22:21:08.192249Z",
-  "updated_at": "2026-10-08T22:21:08.213687Z"
+  "created_at": "2026-10-08T23:25:24.191828Z",
+  "updated_at": "2026-10-08T23:25:24Z"
 }
 ```
 
-`status` is one of `PENDING → PROCESSING → COMPLETED | FAILED`. While not `COMPLETED`, `feature_count` and `crs`
-are `null`; when `FAILED`, `error` explains why. Poll this endpoint after uploading.
-
-`warnings` lists non-fatal problems. If one folder (layer) of a multi-folder KML cannot be read, it is skipped, the file
-is still `COMPLETED`, and the skipped layer is reported instead of being dropped silently:
+`status` moves `PENDING`, `PROCESSING`, then `COMPLETED` or `FAILED`. `feature_count` and `crs` are null until it completes. A failed file explains itself:
 
 ```json
-{ "status": "COMPLETED", "feature_count": 1, "warnings": ["KML layer 'Roads' could not be read and was skipped; its features are missing."] }
+{"status": "FAILED", "feature_count": null, "crs": null, "error": "'sf.shp' does not declare a coordinate reference system (missing .prj). Include the .prj file in the ZIP.", "warnings": []}
 ```
 
-`crs` is `EPSG:<code>` only when the file's CRS exactly matches that EPSG definition; otherwise it is
-`CUSTOM:<first 100 characters of its WKT>` (see [CRS labelling](#crs-labelling)).
+`warnings` is for partial reads. If one folder of a multi-folder KML can't be parsed, the file still completes, and the skipped folder is named here, for example `["KML layer 'Roads' could not be read and was skipped; its features are missing."]`. An unknown id is `404 FILE_NOT_FOUND`; a malformed id is `422 VALIDATION_ERROR`.
 
-### `GET /api/files/{id}/measurements/` — per-feature measurements
+### GET /api/files/
 
-Query params: `page` (default `1`), `page_size` (default `50`, max `500`).
+Lists uploads, newest first. Query parameters: `page` (default 1) and `page_size` (default 20, maximum 100).
 
 ```bash
-curl "http://localhost:8000/api/files/d518ba8f-66b0-491e-8c45-86af0a5acb53/measurements/?page=1&page_size=2"
+curl "http://localhost:8000/api/files/?page=1&page_size=2"
 ```
-
 ```json
 {
-  "file_id": "d518ba8f-66b0-491e-8c45-86af0a5acb53",
   "page": 1,
   "page_size": 2,
+  "total": 1,
+  "total_pages": 1,
+  "items": [
+    {
+      "id": "8e4bcba8-dfcc-4609-b116-718620bb14b3",
+      "filename": "survey.kml",
+      "status": "COMPLETED",
+      "feature_count": 3,
+      "crs": "EPSG:4326",
+      "created_at": "2026-10-08T23:25:24.191828Z"
+    }
+  ]
+}
+```
+
+### GET /api/files/{id}/measurements/
+
+Returns the features of a completed file, ordered by `feature_id`, one page at a time. Query parameters: `page` (default 1) and `page_size` (default 50, maximum 500).
+
+```bash
+curl "http://localhost:8000/api/files/8e4bcba8-dfcc-4609-b116-718620bb14b3/measurements/?page_size=3"
+```
+```json
+{
+  "file_id": "8e4bcba8-dfcc-4609-b116-718620bb14b3",
+  "page": 1,
+  "page_size": 3,
   "total": 3,
-  "total_pages": 2,
+  "total_pages": 1,
   "items": [
     {
       "feature_id": 0,
@@ -197,351 +180,151 @@ curl "http://localhost:8000/api/files/d518ba8f-66b0-491e-8c45-86af0a5acb53/measu
         "coordinates": [[[77.0, 28.0], [77.01, 28.0], [77.01, 28.01], [77.0, 28.01], [77.0, 28.0]]]
       },
       "crs": "EPSG:4326",
-      "properties": { "Name": "Poly", "Description": "" },
-      "measurement": { "type": "area", "value": 1090165.1617245723, "unit": "m²", "projected_crs": "EPSG:32643" }
+      "properties": {"Name": "Poly", "Description": ""},
+      "measurement": {"type": "area", "value": 1090165.1617245723, "unit": "m²", "projected_crs": "EPSG:32643"}
     },
     {
       "feature_id": 1,
       "geometry_type": "LineString",
       "geometry": "LINESTRING (77 28, 77.01 28)",
-      "geometry_geojson": { "type": "LineString", "coordinates": [[77.0, 28.0], [77.01, 28.0]] },
+      "geometry_geojson": {"type": "LineString", "coordinates": [[77.0, 28.0], [77.01, 28.0]]},
       "crs": "EPSG:4326",
-      "properties": { "Name": "Line", "Description": "" },
-      "measurement": { "type": "length", "value": 983.6971724179657, "unit": "m", "projected_crs": "EPSG:32643" }
+      "properties": {"Name": "Line", "Description": ""},
+      "measurement": {"type": "length", "value": 983.6971724179657, "unit": "m", "projected_crs": "EPSG:32643"}
+    },
+    {
+      "feature_id": 2,
+      "geometry_type": "Point",
+      "geometry": "POINT (77 28)",
+      "geometry_geojson": {"type": "Point", "coordinates": [77.0, 28.0]},
+      "crs": "EPSG:4326",
+      "properties": {"Name": "Pt", "Description": ""},
+      "measurement": {"type": null, "value": null, "unit": null, "projected_crs": null}
     }
   ]
 }
 ```
 
-- `feature_id` is the zero-based index of the feature within the file (numbered consecutively if a ZIP contains several Shapefiles).
-- `geometry` is WKT in the **original** CRS (`crs`), unchanged from the file. `geometry_geojson` is the same geometry
-  **reprojected to WGS84** as 2D GeoJSON (Z dropped, 6 decimal places ≈ 0.1 m) — what web maps need. It is `null` only
-  for features without usable geometry.
-- `measurement.projected_crs` is the UTM CRS actually used for the measurement.
-- Points (and any unsupported geometry) return `"measurement": {"type": null, "value": null, "unit": null, "projected_crs": null}`.
+`geometry` is the WKT exactly as read from the file, in the file's own CRS. `geometry_geojson` is the same geometry reprojected to WGS84 as 2D GeoJSON, rounded to six decimals (about 10 cm), because a web map needs lon/lat and the original CRS could be anything. It is null only for a feature that had no geometry. `measurement.projected_crs` records which UTM zone the value was computed in. A point, or a geometry type I don't measure, gets a measurement whose fields are all null rather than an error.
 
-### `GET /health`
+Calling this before processing finishes is `409 FILE_NOT_READY`. For a failed file it is `422 FILE_PROCESSING_FAILED`, with the reason in `detail`.
 
-Returns `{"status": "ok"}` when the database is reachable (used by Docker and Render). If it is not, it returns
-**503** `{"detail": "Database unavailable", "code": "DB_UNAVAILABLE"}`.
+### GET /health
 
-### Errors
-
-Every error uses the same body: `{"detail": "<human-readable message>", "code": "<MACHINE_CODE>"}`.
-
-| Status | `code` | When |
-|---|---|---|
-| 400 | `INVALID_FILE_TYPE` | Extension not `.zip`/`.kml`, or content doesn't match the extension |
-| 400 | `EMPTY_FILE` | Zero-byte upload |
-| 404 | `FILE_NOT_FOUND` | Unknown file id |
-| 409 | `FILE_NOT_READY` | Measurements requested while `PENDING`/`PROCESSING` |
-| 413 | `FILE_TOO_LARGE` | Exceeds `MAX_UPLOAD_SIZE_MB` |
-| 422 | `CORRUPT_FILE` | Not a valid ZIP / no `.shp` inside / not KML — detected at upload |
-| 422 | `FILE_PROCESSING_FAILED` | Measurements requested for a file whose background parse failed (`detail` has the reason) |
-| 422 | `VALIDATION_ERROR` | Bad request params (e.g. malformed UUID, `page=0`, missing `file` field) |
-| 503 | `DB_UNAVAILABLE` | `/health` only: database unreachable |
-| 500 | `INTERNAL_ERROR` | Anything unexpected — logged server-side, never leaked to the client |
-
-```bash
-curl -s -F "file=@notes.txt" http://localhost:8000/api/files/
-# {"detail":"Invalid file type. Upload a .zip (Shapefile) or a .kml file.","code":"INVALID_FILE_TYPE"}
-```
-
----
+Runs `SELECT 1`. It returns `{"status": "ok"}`, or `503` with `{"detail": "Database unavailable", "code": "DB_UNAVAILABLE"}` when the database can't be reached. I made it 503 rather than 500 because that is what Render's health check and load balancers treat as "not ready".
 
 ## Architecture
 
-### Layout
+### Structure
 
-```
-app/
-├── main.py                  # app factory, lifespan (create tables, fail interrupted jobs), CORS, request-id/access-log middleware, /health, frontend mount
-├── api/routes/files.py      # thin HTTP layer: validate params → call service → shape response
-├── services/
-│   ├── file_service.py      # orchestration: store upload, run pipeline, DB queries
-│   ├── file_parser.py       # ZIP/KML → plain feature records (safe extraction, JSON-safe properties)
-│   ├── crs_handler.py       # CRS labels, UTM zone detection, reprojection
-│   └── measurement.py       # area / length / graceful no-op, always via crs_handler
-├── models/models.py         # UploadedFile, Feature (SQLAlchemy 2.0)
-├── schemas/schemas.py       # Pydantic v2 request/response models
-├── db/{base,session}.py     # declarative base, async engine + session dependency
-└── core/{config,logging,exceptions,middleware,static}.py   # middleware.py: Content-Length upload guard; static.py: SPA files + index.html fallback
+The rule I held to is that route handlers contain no logic. `app/api/routes/files.py` declares parameters and OpenAPI metadata and makes one call into `app/services/file_service.py`. That module is the only place that touches both the database and the geospatial code. It stores uploads, runs the background job, and builds the response schemas.
 
-frontend/                    # React + TypeScript SPA (built into frontend/dist, served by the API at "/")
-├── src/api/                 # typed fetch client (ApiError) and response interfaces
-├── src/hooks/               # useFileUpload, useFileStatus, useFileList, useFileMeasurements, useMapFeatures
-├── src/components/          # small single-purpose components (UploadZone, ResultsMap, MeasurementsTable, …)
-└── src/utils/format.ts      # formatting, client-side file validation, geometry colours
-```
+The geospatial code sits below it in three modules that know nothing about HTTP or SQL, which is what makes them easy to test with plain Shapely objects. `file_parser.py` turns a ZIP or KML into feature records. `crs_handler.py` owns every CRS decision: labels, UTM zone selection, reprojection. `measurement.py` computes areas and lengths and only ever gets geometries through `crs_handler`, so there is no code path that measures in degrees by accident.
 
-Dependencies point one way: `routes → file_service → {file_parser, measurement → crs_handler}`. Route handlers
-contain no business logic. The geospatial modules are pure and synchronous (no DB, no HTTP), so they're trivial to test.
+Cross-cutting pieces live in `app/core/`: settings (`config.py`), JSON logging with a per-request id (`logging.py`), the error classes and handlers that produce the `{"detail", "code"}` shape (`exceptions.py`), the Content-Length guard (`middleware.py`), and the static-file mount that serves the frontend (`static.py`). The frontend is in `frontend/`: a typed fetch client, one hook per API call, and small components.
 
-### File-processing flow
+### From upload to stored measurements
 
 ```
 POST /api/files/
-   │  0. middleware: declared Content-Length over the limit → 413 immediately, body never read
-   │  1. validate filename/extension, stream to disk with size cap, sniff magic bytes
-   │  2. cheap structural check (valid ZIP w/ .shp, KML root element)  ──fail──▶ 400/413/422, file deleted
-   │  3. INSERT uploaded_files (status=PENDING), commit
-   │  4. schedule background task, return 202 {id, status}
-   ▼
-Background task: process_file(id)
-   │  (at app startup, any job still PENDING/PROCESSING is marked FAILED — see "Startup recovery")
-   │  status → PROCESSING (committed, visible to pollers)
-   │  worker thread (asyncio.to_thread, keeps the event loop free):
-   │     ZIP: safe-extract to temp dir (zip-slip / zip-bomb / encryption guards) → read each .shp with GeoPandas
-   │     KML: read every layer with GeoPandas (Fiona KML driver); an unreadable layer is skipped and
-   │          recorded as a warning (file still COMPLETED), never dropped silently
-   │     per feature: index, geometry type, WKT, CRS, JSON-safe properties
-   │     per source CRS (batch): bulk reproject → WGS84, group by UTM zone, measure   ← see below
-   │     per batch: GeoJSON in WGS84 (2D, rounded) for map display
-   │  bulk INSERT features (batches of 1000) + status=COMPLETED + feature_count + crs + warnings  — ONE transaction
-   │  any failure → rollback, status=FAILED + safe error message (full traceback only in logs)
-   ▼
-GET /api/files/{id}/  and  /measurements/   (poll until COMPLETED)
+  Content-Length over the limit?  -> 413, body never read
+  validate name + magic bytes; stream to uploads/<uuid>.<ext> under the size cap
+  cheap structure check (ZIP has a .shp / KML has <kml>)  -> 400/413/422, file deleted
+  INSERT uploaded_files (PENDING); commit; schedule background task; return 202
+
+background task process_file(id)            (runs after the response is sent)
+  status -> PROCESSING (own commit, so pollers see it)
+  in a worker thread:
+    ZIP: extract safely, read each .shp  |  KML: read each layer
+    group features by source CRS
+      one call: all geometries -> WGS84; centroids and UTM zones in numpy
+      group by UTM zone; one reprojection call per group; vectorised area/length
+      build GeoJSON from the WGS84 geometries
+  one transaction: INSERT features (batches of 1000) + status COMPLETED + counts + warnings
+  any exception: rollback, status FAILED + a user-safe message (traceback only in logs)
 ```
 
-### Measurement flow
+### Background tasks
 
-```
-geometry (original CRS)
-   ├─ None / empty ................ warn, measurement = null
-   ├─ Point / MultiPoint .......... measurement = null (by design)
-   ├─ other types (GeometryCollection, …) ... warn, measurement = null
-   └─ Polygon / MultiPolygon / LineString / MultiLineString
-         1. reproject ALL geometries → WGS84 in one call; centroids + UTM zones via numpy   (crs_handler)
-         2. GROUP features by target UTM CRS; one reprojection call per group                (crs_handler)
-         3. polygon → .area (m²) · line → .length (m), vectorized per group                  (measurement)
-         4. store value, unit, and projected CRS alongside the original CRS
-```
+Processing uses FastAPI's `BackgroundTasks`, which runs the job in the same process after the response is sent. The job opens its own database session, because the request's session is gone by then. GeoPandas, GDAL and PROJ are synchronous and CPU-heavy, so the parse and measure step runs in `asyncio.to_thread`; run inline, it would freeze every other request for the length of a big file.
 
-Files are processed in bulk by `measure_geometries`: instead of two Python-level PROJ transforms *per feature*, every
-geometry goes to WGS84 in one `GeoSeries.to_crs` call, and each UTM group goes to its zone in one more call (at most
-~60 per source CRS). Each feature still gets its own projected geometry, zone and measurement; results are identical to
-the single-feature `measure_geometry` (a test asserts this). On a 30,000-feature benchmark spread over many zones the
-file-to-rows step went from 2.4 s to 0.5 s (≈ 5× faster, same output).
+The job never raises. Domain errors become a `FAILED` status with their own message; anything unexpected is logged with a traceback and stored as a generic message, so a client never sees an internal error. The features and the `COMPLETED` status are written in one transaction, which means a poller can't see a half-ingested file.
 
-Neither function raises: a failure on one feature is logged and yields a null measurement, and if a whole zone group
-fails the bulk path retries that group feature by feature, so one bad geometry can't fail its neighbours or the file.
+The cost of in-process tasks is that a job dies with the process. To keep that from leaving a file in `PROCESSING` forever, startup marks every `PENDING` or `PROCESSING` file as `FAILED` with "Service restarted before processing completed". There is no age threshold, since any such job at startup can only belong to the previous process. That is only correct with one running instance; see the limitations.
 
-### Data model
+## CRS handling
 
-- `uploaded_files` — id (UUID), filename, stored_path, file_size, status, feature_count, crs, error_message,
-  warnings (JSONB list), timestamps.
-- `features` — file_id (FK, cascade), feature_index, geometry_type, geometry_wkt, geometry_geojson (**JSONB**, WGS84),
-  crs, properties (**JSONB**), measurement_{type,value,unit,crs}. All CRS columns are `TEXT`: a CRS's WKT can be hundreds
-  of characters, and a `VARCHAR(255)` would make PostgreSQL reject the insert (SQLite would not, so tests alone can't catch it). Unique index on `(file_id, feature_index)` serves the paginated query.
+Geographic coordinates are angles. A degree of longitude is about 111 km at the equator and shrinks to nothing at the poles, so a polygon's area in "square degrees" is not a measurement of anything. Measuring means projecting first, so that coordinates are in metres on a flat plane.
 
-Measurements and GeoJSON are computed once at processing time and stored, so reads are cheap pagination queries.
+For each polygon or line I take the centroid of the feature in WGS84, work out its UTM zone (`floor((lon + 180) / 6) + 1`, EPSG 326xx in the northern hemisphere and 327xx in the southern), reproject the geometry to that zone, and measure there. Both CRSs are stored: `crs` is the original, `measurement.projected_crs` is the zone used. Beyond 84°N and 80°S, UTM isn't defined, so those features use the UPS polar projections (EPSG:32661 and 32761). Longitudes are wrapped, so ±180° land in zones 1 and 60 as they should.
 
-### Startup recovery
+Zones are chosen per feature, not per file, so a file that spans several zones is measured near each feature's own central meridian. I reproject even when the file is already projected, because a projected CRS can be in feet (US State Plane, for example) and measuring "as is" would give the wrong unit with no error. A Shapefile with no `.prj` is rejected with a message asking for one, rather than assuming a CRS: a wrong guess produces plausible numbers that are simply wrong. KML is defined to be WGS84, so that is assumed when the driver reports nothing.
 
-Processing runs as in-process background tasks, so a job that is `PENDING` or `PROCESSING` when the service *starts* can
-only be an orphan of the previous process. On startup **every** such job is marked `FAILED` with the reason
-`"Service restarted before processing completed"` (there is no age threshold — a crash two minutes ago must be recovered
-too). Clients polling that file see `FAILED` and the reason, and can re-upload. This assumes a **single running
-instance**: with several instances, one starting would fail another's live jobs (a real queue is the fix — see future scope).
+The `crs` label is never a guess. It is `EPSG:<code>` only when PROJ identifies the CRS with 100% confidence and the registry definition equals the file's CRS. Otherwise it is `CUSTOM:` followed by the first 100 characters of the CRS's WKT. A `CUSTOM:` file is still measured correctly, because measurement uses the CRS object, not the label. PROJ's default behaviour is to accept a 70% match: a Transverse Mercator I wrote by hand, with a central meridian of 75° and the UTM scale factor, came back as `EPSG:32643`, which it is not. The label is what users see, so I would rather say "custom" than name the wrong CRS.
 
----
+The limitation, which I would rather state than hide: UTM preserves shape, not area. Each zone is accurate close to its central meridian, with scale error up to about 0.1% inside the zone, and the error grows with distance from it. Every feature is measured in the single zone of its centroid, so a feature that spans several zones (a country, a large state) is measured with a projection that gets worse toward its edges, and the API doesn't flag it. For plots, roads and buildings this is negligible. For continental polygons it is not.
 
-## CRS handling strategy
+## Design decisions
 
-**Rule: area and length are never computed in degrees.** For every measurable feature:
+**FastAPI instead of Django with DRF.** The assignment allowed either. I picked FastAPI because the whole request path can be async end to end, with async SQLAlchemy and asyncpg, and because Pydantic models give me the OpenAPI document for free. Django would have been the better choice if I had wanted GeoDjango and PostGIS, but I didn't need spatial queries, only measurements.
 
-1. Take the feature's centroid, expressed in WGS84 (transforming first if the file uses another CRS).
-2. Pick the UTM zone: `zone = floor((lon + 180) / 6) + 1`; EPSG `326xx` for the northern hemisphere, `327xx` for the southern.
-3. Reproject the geometry to that zone and measure there (units are metres).
-4. Persist both the **original CRS** (`crs`) and the **projected CRS used** (`measurement.projected_crs`).
+**`BackgroundTasks` instead of Celery or ARQ.** A queue is the right answer once you need retries, several workers or progress reporting. It also means running Redis and a worker process, and for a service this size that operational weight buys nothing yet. The price is the single-instance restriction above, which I accepted and wrote down. The status field is persisted, so moving to a queue later changes how the job is started, not the API.
 
-Details worth knowing:
+**UTM per feature instead of one projection per file, an equal-area projection, or geodesic math.** One projection per file is wrong as soon as a file spans zones. An equal-area projection such as Lambert azimuthal centred on each feature would give better areas for large features, but it means building a custom CRS per feature, and the result is harder to explain and to store as a label. `pyproj.Geod` would be the most accurate and avoids projection entirely, but the assignment asked for a projected CRS, and geodesic area on complex or invalid polygons has its own edge cases. UTM is the standard answer at survey scale, and I documented where it stops working.
 
-- **Zone is chosen per feature**, not per file, so a file spanning several zones is still measured near each feature's own central meridian.
-- **Already-projected inputs are still reprojected**, because a projected CRS may use feet (e.g. US State Plane) — measuring "as is" would silently return the wrong unit.
-- **Polar regions:** UTM is undefined beyond 84°N / 80°S, so those features use UPS (EPSG:32661 / 32761).
-- **Antimeridian:** longitude is wrapped, so `±180` maps to zone 1/60 correctly.
-- **KML** is defined to be WGS84, so it's assumed `EPSG:4326` if the driver reports no CRS. **Shapefiles with no `.prj`** are rejected with a clear message rather than guessing a CRS — a wrong guess would produce plausible-looking but wrong numbers.
-- Transformers are cached (`lru_cache`) since constructing them is the expensive part, and use `always_xy=True` to avoid axis-order bugs. The bulk path relies on GeoPandas, which also uses `always_xy=True`.
+**Compute once at ingest and store, instead of computing on read.** Measurements, WKT and the WGS84 GeoJSON are all computed during processing and stored, so the read endpoints are plain paginated queries. The cost is extra storage, since every feature carries two copies of its geometry. I didn't use PostGIS geometry columns, because nothing here needs a spatial query, and PostGIS would complicate every local setup.
 
-### Accuracy limits: features spanning several UTM zones
+**Grouping features by UTM zone and reprojecting each group in one call.** My first version transformed each feature on its own, twice: once to WGS84 to find its zone, then again into UTM. The current version reprojects every geometry to WGS84 in one GeoPandas call, computes all the centroids and zones with numpy, groups features by zone, and does one reprojection per group. Results are identical, and a test asserts that, plus a spy that asserts the number of PROJ calls equals the number of zones. On 30,000 synthetic features spread over many zones, on my laptop, the file-to-rows step dropped from 2.43 s to 0.49 s; 100,000 features take 1.64 s. If a whole group fails, that group is retried feature by feature, so one bad geometry still can't take its neighbours down.
 
-UTM is a **conformal** projection, not an **equal-area** one: it preserves local shape and angles, not area. Each zone
-is only accurate close to its central meridian (scale error ≲ 0.1 % within the zone), and the area error grows as you move
-away from it. Because every feature is measured in exactly **one** zone — the zone of its centroid — a feature that
-extends across several zones is measured with a projection that is increasingly wrong towards its far edges.
+**Cheap validation at upload, real parsing in the background.** Wrong extension, mismatched content, empty file, oversize, and a ZIP with no `.shp` all fail immediately with a 4xx, so the common mistakes get fast feedback. Everything that needs GDAL happens in the background and surfaces as `FAILED`. The alternative, parsing synchronously, gives a simpler contract but ties up a request for however long a large file takes and invites proxy timeouts.
 
-- For ordinary survey-scale features (plots, roads, buildings, farms — well inside one 6°-wide zone) this is negligible.
-- For **large polygons** such as state or country boundaries, area accuracy **degrades**, and the error **increases with the
-  feature's geographic extent**. Line lengths are affected the same way. The API does not currently flag these features;
-  the returned value looks as precise as any other.
-- **Future improvement:** detect multi-zone features (bounds spanning more than one zone) and either switch them to a
-  local equal-area projection (e.g. Lambert azimuthal equal-area centred on the feature) or compute **geodesic** area and
-  length with `pyproj.Geod`, which has no projection distortion at all. Until then, treat measurements of very large
-  features as approximate.
+**A partly readable KML completes with warnings.** A KML with several folders where one is broken is still mostly useful. Failing the whole file throws away good data, and silently skipping the folder hides the loss, so I take the middle path: complete, and list exactly what was skipped in `warnings`. A Shapefile ZIP is different: an unreadable `.shp` fails the file, because there is no equivalent of "the rest of it".
 
-### CRS labelling
+**The frontend is served by the API.** One origin means no CORS in production and one service to deploy on Render. A separate static host would cache better, but needs CORS and two deployments for a project of this size. In development I run Vite separately and rely on the permissive development CORS setting.
 
-The stored/returned `crs` is never a guess. `crs_label()` reports `EPSG:<code>` only if PROJ identifies the CRS with
-**100 % confidence** *and* `CRS.from_epsg(code) == crs`. Anything else — no match, a fuzzy match, or a definition that
-merely resembles a registry entry — is labelled `CUSTOM:<first 100 characters of its WKT>`. (PROJ's default 70 %-confidence
-matching would label a lookalike Transverse Mercator as `EPSG:32643`; that is exactly what this prevents.) Measurement
-always uses the real CRS object, never the label, so a `CUSTOM` file is measured correctly.
+**SQLite for the test suite.** It makes tests run in a second with nothing to install, and the JSON column falls back from JSONB. It also cost me a bug: see below. The right fix is running a subset against Postgres in CI, which I list under future scope.
 
----
+## Known limitations
 
-## Frontend
+- Processing is in-process, so the service must run as one instance with one Uvicorn worker. Several instances would fail each other's live jobs at startup, and several workers would need a real queue. A job in flight when the process dies is lost and shows up as `FAILED`.
+- Uploaded files are never deleted. The ZIP or KML stays on disk after processing, even though everything useful is in Postgres, and `FAILED` uploads leave theirs behind too. On Render's free tier the filesystem is wiped on every redeploy, which hides the problem there. Anywhere with a persistent disk, usage grows with every upload.
+- Features that span several UTM zones are measured less accurately, as described above. Nothing in the response says so.
+- There is no authentication or rate limiting. Anyone who can reach the API can upload.
+- The Content-Length guard can't see the size of chunked uploads. Those are streamed to disk until the limit is hit, then cleaned up. In production I would also set a body-size limit at the proxy.
+- GeoPandas reads a whole file into memory, so very large files need a lot of RAM.
+- Invalid polygons, such as self-intersecting rings, are measured anyway. Shapely's area for them may be wrong, and the only signal is a log line.
+- Schema changes need a manual database reset, because there are no migrations.
+- A ZIP containing Shapefiles in different CRSs reports a comma-joined string in the file-level `crs`. Each feature still has its correct `crs`.
+- KMZ and UTF-16 KML are not supported, and the Norway/Svalbard UTM zone exceptions are ignored.
+- The map draws at most 5,000 features and says so when a file has more. The table is paginated server-side and has no such limit.
+- Map tiles come from OpenStreetMap, so the map needs internet access.
+- On Render's free tier the service idles out, and the free Postgres instance expires after a fixed period, so it is not suitable for anything you need to keep.
 
-A single-page React app (no router) with three states, driven by the file's live status:
+## Future scope
 
-1. **Upload** — drag-and-drop / click zone (`.zip` and `.kml` enforced client-side), file name + size, an Upload button, and
-   a list of recent uploads (status badge, feature count, **View**) refreshed every 5 s.
-2. **Processing** — spinner and status while `PENDING`/`PROCESSING`; polls every 3 s and switches to results automatically.
-   `FAILED` shows the server's error message.
-3. **Results** — left (40 %): file card, a yellow banner if the file has `warnings`, and a paginated (20/page) measurements
-   table with collapsible properties. Right (60 %): a Leaflet map drawing each feature's `geometry_geojson`, coloured by type
-   (Polygon blue, LineString orange, Point red), fitted to all features. Clicking a feature (map or table row) highlights it
-   and shows its measurement in a popup; clicking on the map also jumps the table to that feature's page.
+- Replace `BackgroundTasks` with ARQ and Redis: retries, a heartbeat per job instead of "fail everything at startup", progress reporting, and a webhook or server-sent event to replace polling.
+- Delete the stored upload right after successful processing, and add a periodic job that removes the files of `FAILED` uploads after a configurable TTL, something like `FAILED_UPLOAD_TTL_HOURS`.
+- Detect features whose bounds cross a UTM zone boundary and flag them in the response. For those, compute area and length with `pyproj.Geod` or a local equal-area projection.
+- Add Alembic migrations in place of `create_all`.
+- Run the test suite against Postgres in CI with Testcontainers, so column-length and JSONB problems are caught before deploy.
+- Add Playwright tests for upload, polling and the map, and Vitest for the hooks.
+- Add PostGIS, so I can answer bounding-box and intersects queries, and a GeoJSON export endpoint.
+- Support KMZ and GeoPackage, and report invalid polygons as a field in the measurement instead of a log line.
+- Move uploads to object storage, and add authentication with per-user file ownership.
+- Serve very large files to the map as vector tiles or clustered points rather than raw GeoJSON.
 
-Notes: the map fetches features page by page (200 at a time) up to a cap of 5,000 and says so if a file is larger; the
-table is server-paginated and has no such limit. Map tiles come from OpenStreetMap, so the map needs internet access.
+## What I learned
 
-### Run the frontend in dev mode (separately from the API)
+The most useful lesson was how much a passing test suite can hide. My tests ran on SQLite, which ignores `VARCHAR(255)`. A Shapefile with a custom projection produces a CRS label of several hundred characters, which PostgreSQL would have rejected, turning a valid upload into a `FAILED` file with a generic error. Every test was green. I found it by reviewing the code rather than by running it, changed the columns to `TEXT`, then confirmed on a real Postgres container that the same file now completes. I also added a test that asserts the column types directly, since a test of behaviour can't see this class of bug on SQLite.
 
-```bash
-# terminal 1 — API (Docker or local), on http://localhost:8000
-docker compose up --build        # or: uvicorn app.main:app --reload
+The same review caught the CRS label problem. I had trusted `crs.to_epsg()`, whose default accepts a 70% match, so a lookalike projection was being reported as a registered EPSG code. It never raised an error and the measurements were still right; only the label lied. That one only shows up if you go looking for it.
 
-# terminal 2 — Vite dev server with hot reload, on http://localhost:5173
-cd frontend
-cp .env.example .env             # optional; VITE_API_BASE_URL defaults to http://localhost:8000 in dev
-npm install
-npm run dev
-```
+My first startup recovery only failed jobs older than 30 minutes. A job that died two minutes before a restart would stay `PROCESSING` forever, and my README claimed otherwise. The age threshold made sense in my head and was wrong for a single instance.
 
-CORS allows this out of the box when `ENVIRONMENT=development` (`ALLOWED_ORIGINS` defaults to `*`). For any other
-environment set `ALLOWED_ORIGINS=http://localhost:5173`.
+I learned that Starlette reads and spools the entire multipart body before your handler runs, so a size check inside the handler is too late: a 5 GB upload has already consumed the disk. The check has to look at the `Content-Length` header in middleware. I tested that by giving the middleware a `receive` function that fails the test if it is called, and then with curl against a real server: a 300 MB upload against a 1 MB limit was refused in 2 ms with no bytes sent.
 
-Other commands: `npm run build` (type-check + production build into `frontend/dist`), `npm run lint`.
-A production build with `VITE_API_BASE_URL` unset calls the API on the **same origin**, which is how the Docker image and
-Render deployment work (no CORS needed). The code is TypeScript `strict` with no `any`; API calls live in typed hooks
-(`useFileUpload`, `useFileStatus`, `useFileList`, `useFileMeasurements`, `useMapFeatures`) and every query/mutation error is
-rendered, never thrown.
+Packaging produced two surprises. Fiona publishes no Linux arm64 wheels, so my Docker build failed on an Apple Silicon laptop and needed GDAL compiled from source there. Then the first Render deploy failed with `ImportError: libexpat.so.1`: the x86_64 wheel bundles GDAL, but `python:3.12-slim` doesn't ship libexpat, and my Dockerfile only ran `apt-get` on the arm64 path. Running `ldd` over the wheel's shared objects showed the full picture: the bundled libraries have hashed names, and `libexpat` is the single unhashed one it expects from the system. I reproduced the failure in a `linux/amd64` container before changing the Dockerfile, and found that nothing else was missing.
 
----
+Two performance facts are worth keeping. `pyproj.CRS.__hash__` is `hash(self.to_wkt())` (I read the source), so using a CRS as a dictionary key or `lru_cache` argument once per feature serialises it to WKT every time; I now group by object identity and compute the label once per CRS. And the 5x speed-up in the benchmark above came from two changes together: one PROJ call per UTM zone instead of two Python-level transforms per feature, and no per-feature CRS handling.
 
-## Design decisions & alternatives
-
-| Decision | Why | Alternatives considered |
-|---|---|---|
-| **FastAPI** (async) | Native async fits async SQLAlchemy; typed schemas give OpenAPI for free. | Django + DRF: heavier, sync-first; its ORM/GeoDjango would be a good fit if PostGIS were the goal. |
-| **`BackgroundTasks` for processing** | Zero extra infrastructure; sufficient for this scope. Status is persisted, so clients poll. Jobs orphaned by a crash are marked `FAILED` on startup. | Celery/RQ/ARQ + Redis: right answer for scale/retries (see future scope) but adds a broker and worker to operate. |
-| **Blocking geo work in `asyncio.to_thread`** | GeoPandas/GDAL/PyProj are synchronous and CPU-bound; running them inline would stall every request. | `ProcessPoolExecutor` for true parallelism (GIL is largely released in GDAL/GEOS, so a thread is enough for now). |
-| **UTM auto-detection** | One global rule, metre units, scale error of at most ~0.1 % inside a zone — accurate for survey-scale features. | Local equal-area CRS (e.g. LAEA at centroid): better for area, but zone-less CRSs are harder to reason about/report. Geodesic calculation (`pyproj.Geod`): most accurate and projection-free, but the brief asks for projection-based measurement, and it makes area of invalid/complex polygons trickier. |
-| **Store results in Postgres (JSONB properties)** | Compute once, serve many paginated reads; attributes are schemaless across files. | Recompute on every GET (wasteful); PostGIS geometry columns (enables spatial queries, but not required by the brief and complicates local setup — see future scope). |
-| **Geometry stored as WKT text + GeoJSON (WGS84)** | WKT is the faithful original; GeoJSON is precomputed once at ingest so reads never re-project and the map gets what it needs. Costs extra storage per feature. | Convert on every read (CPU per request); WKB / PostGIS `geometry` (see future scope). |
-| **Fail all in-flight jobs on startup** | Correct for a single instance, simple, and recovers crashes immediately; an age threshold would leave a job that died 2 minutes ago `PROCESSING` forever. | Heartbeat/lease per job (right for multiple instances). |
-| **Partial KML read ⇒ `COMPLETED` + `warnings`** | A multi-folder KML with one broken folder is still mostly useful; the user is told exactly what is missing instead of getting a silently smaller file. | Fail the whole file (loses good data); skip silently (hides data loss). |
-| **Frontend served by FastAPI at `/`** | One deployable, same origin (no CORS in production), one Render service. | Separate static host/CDN (better caching, needs CORS + two deploys). |
-| **Map loads all features, table is server-paginated** | The map must show every feature and fit to them; the table stays fast for any size. | Client-side pagination (simpler but loads everything up front); vector tiles for very large files. |
-| **Whole file processed in one transaction** | A file is never observed half-ingested; failure leaves no partial rows. | Streaming per-feature commits: better memory profile for huge files, worse atomicity. |
-| **`create_all` on startup** | Simplest for a two-table service. | Alembic migrations — needed as soon as the schema evolves (future scope). |
-| **`202 Accepted` on upload** | Accurately signals "accepted, not yet processed". | `201 Created` (resource exists, but the result doesn't yet). |
-| **Cheap validation at upload, full parse in background** | Obvious bad input gets an immediate 4xx; the expensive parse never blocks a request. Deep parse failures surface as `FAILED` status + `422` on the measurements endpoint. | Full synchronous parse: simplest contract, but slow requests and timeouts on big files. |
-| **Settings via `os.environ` + `python-dotenv`** | As specified; a frozen dataclass is typed and fails fast on bad values. | `pydantic-settings` (equivalent, extra dependency). |
-| **Tests on SQLite, app on Postgres** | Fast, zero-setup test runs; the JSON column falls back from JSONB. | Testcontainers/Postgres in CI for full fidelity (listed under future scope). |
-
-**Security hardening included:** server-generated storage names (client filename never touches the filesystem path),
-zip-slip rejection, uncompressed-size and member-count limits (enforced on actual bytes written, since headers can lie),
-encrypted-ZIP rejection, upload size cap enforced up front from `Content-Length` (and while streaming as a fallback), magic-byte sniffing, non-root container user.
-
-**Known limitations:** processing uses in-process tasks, so run exactly **one** Uvicorn worker and one instance (as the
-Dockerfile does). An in-flight job is lost if the process dies and is marked `FAILED` on the next start; multi-worker or
-multi-instance deployments need a real queue (and would otherwise fail each other's jobs at startup). Very large files are
-loaded into memory by GeoPandas. Area is measured in a single UTM zone per feature, so very large multi-zone features are
-less accurate (see [Accuracy limits](#accuracy-limits-features-spanning-several-utm-zones)). There is no authentication;
-anyone who can reach the API can upload. The `Content-Length` guard cannot see the size of chunked uploads, which are
-streamed until the limit is hit; also enforce a body-size limit at your reverse proxy in production.
-
-**Uploaded files are not cleaned up.** Uploaded files (ZIP and KML) are stored on disk permanently after processing.
-The parsed data lives in PostgreSQL, so the raw files are **not needed after processing — but they are not currently
-deleted**, including the files of `FAILED` uploads. Disk usage therefore grows with every upload. On Render's free tier
-the filesystem is ephemeral anyway, so files are lost on every redeploy or restart (which is harmless here, since the
-results are in Postgres); on a persistent disk or a local Docker volume they accumulate indefinitely.
-**Future improvement:** delete each file immediately after successful processing, and run a periodic cleanup job that
-removes the files of `FAILED` uploads after a configurable TTL.
-
----
-
-## Error handling
-
-- **Service layer owns exceptions.** Domain errors (`AppError` subclasses) carry an HTTP status and a stable `code`; handlers render them as `{"detail", "code"}`.
-- **Catch-all handler** converts any unexpected exception to a generic `500 INTERNAL_ERROR` and logs the traceback; clients never see one.
-- **Background task never raises**: it catches everything and records `FAILED` with a safe message.
-- **Per-feature isolation**: unsupported/empty/unprojectable geometries are logged and returned with a `null` measurement.
-- **JSON safety**: attribute values from pandas/numpy (`NaN`, `NaT`, `numpy` scalars, timestamps, bytes) are coerced to valid JSON so they can't break the JSONB insert.
-- **Observability**: structured (JSON) logs with a per-request `x-request-id`, plus `file_id`, `feature_index`, etc. as fields.
-
----
-
-## Testing
-
-```bash
-pip install -r requirements-dev.txt
-pytest
-```
-
-87 backend tests. `tests/test_files.py` covers UTM zone selection (hemispheres, antimeridian, polar), numerically verified
-area/length (a 1 km × 1 km square must measure ≈ 1,000,000 m², not ~1e-4 "degrees²"), non-WGS84 sources, unsupported
-geometries, and the full API: KML and Shapefile uploads, multi-Shapefile ZIPs, pagination, every error code, ZIP-slip,
-missing `.prj`, and filename traversal. `tests/test_hardening.py` covers CRS labelling (exact vs lookalike vs custom, column
-types), startup recovery, partial-KML warnings, `/health` 503, CORS preflight, the file listing, WGS84 GeoJSON (projected
-sources, Z dropped), and SPA static serving (fallback never masks API 404s). `tests/test_middleware.py` proves the
-`Content-Length` guard rejects without reading the body (its `receive` fails the test if called), passes chunked requests
-through to the service-level fallback, and keeps CORS headers on the 413. `tests/test_bulk_measurement.py` asserts the bulk path
-matches the per-feature path across zones, types and CRSs, makes exactly one projection call per UTM group, and isolates a
-failing group or an unprojectable feature.
-
-Tests run against SQLite (no Postgres needed), so they cannot catch PostgreSQL-specific problems such as column-length
-limits (hence the explicit column-type test). The full stack was also verified by hand against PostgreSQL 16 via Docker
-Compose, and the UI was exercised end-to-end in headless Chrome (upload, validation, polling transition, map, popups,
-warnings banner). **There are no automated frontend tests yet** (see future scope).
-
----
-
-## Deployment (Render)
-
-1. Push the repo to GitHub.
-2. In Render: **New → Blueprint**, select the repo. [`render.yaml`](render.yaml) provisions a Docker web service and a
-   managed PostgreSQL, and wires `DATABASE_URL` between them. The Docker build compiles the frontend, so the web app and
-   API are served from the same URL.
-3. Health check path is `/health`.
-
-Notes: the free plan has an **ephemeral filesystem**, which is fine here because results are stored in Postgres and the
-raw upload is only needed during processing. To retain raw files across deploys, upgrade the plan and uncomment the
-`disk:` block in `render.yaml`. Free Render Postgres instances expire after a limited period — use a paid plan for anything long-lived.
-
----
-
-## Learnings & future scope
-
-**Learnings**
-
-- Reprojection is where geospatial code silently goes wrong: the bug isn't a crash, it's a plausible number in the wrong unit. Making "never measure in degrees" a structural property of the code (measurement *only* goes through `crs_handler`) is more robust than remembering to do it.
-- Real-world files are messy: NaN attributes, missing `.prj`, Z coordinates in KML, multiple KML folders, mixed Shapefile layers, hostile ZIPs. Most of the production-hardening effort was in the parsing boundary, not the maths.
-- Background work in an async server needs deliberate thought: blocking GDAL calls belong off the event loop, and "the process died mid-job" needs an explicit recovery story.
-- Packaging matters: Fiona has no Linux arm64 wheels, which only showed up when building the image on Apple Silicon.
-
-**Future scope**
-
-- **Job queue** (ARQ/Celery + Redis) with retries, progress reporting, and horizontal scaling; webhook or SSE on completion instead of polling.
-- **Alembic migrations** instead of `create_all`.
-- **PostGIS**: store native geometries, add spatial queries (`bbox`, `intersects`), and a GeoJSON output option.
-- **Geodesic measurements** (`pyproj.Geod`) as an optional method/cross-check, and a configurable target CRS per request.
-- **More formats**: GeoJSON, GeoPackage, KMZ; formal handling of `LinearRing`/`GeometryCollection` (measure members) and perimeter for polygons.
-- **Streaming/chunked ingestion** for very large files; object storage (S3) for uploads.
-- **Upload file cleanup**: delete the stored ZIP/KML immediately after successful processing, and run a periodic cleanup job that removes files of `FAILED` uploads after a configurable TTL (e.g. `FAILED_UPLOAD_TTL_HOURS`).
-- **Auth & rate limiting**, per-user file ownership.
-- **CI**: lint (ruff), type-check (mypy), tests against Postgres via Testcontainers, image scanning.
-- **Frontend tests** (Vitest + Testing Library, Playwright for the upload → results flow), and vector tiles / clustering for files with very many features.
-- **Multi-zone area accuracy**: UTM is conformal, not equal-area, so large features spanning several zones are measured less accurately. Detect multi-zone features (and flag them in the response), then switch to a local equal-area projection or compute geodesic area/length with `pyproj.Geod`.
+Smaller things I would now do from the start: SQLite timestamps default to one-second resolution, so files uploaded in the same second tied on `created_at` and came back in random order, and I now set the timestamp in Python. A Shapefile can only hold one geometry type, which my first test fixture tried to violate. And Tailwind's reset constrains `<img>` width, which quietly breaks Leaflet's map tiles until you override it.

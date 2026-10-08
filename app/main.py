@@ -93,7 +93,27 @@ if settings.allowed_origins:
     )
 
 
-@app.get("/health", tags=["health"], summary="Liveness / DB readiness probe", response_model=None)
+@app.get(
+    "/health",
+    tags=["health"],
+    summary="Liveness and database readiness probe",
+    description=(
+        "Runs `SELECT 1` against the database. Returns 200 when it succeeds. If the database cannot be reached it "
+        "returns 503 rather than 500, which is what load balancers and Render's health check expect. "
+        "Used by the Docker `HEALTHCHECK` and by `render.yaml`."
+    ),
+    response_description="`{\"status\": \"ok\"}` when the database is reachable.",
+    response_model=None,
+    responses={
+        200: {"content": {"application/json": {"example": {"status": "ok"}}}},
+        503: {
+            "description": "The database is unreachable.",
+            "content": {
+                "application/json": {"example": {"detail": "Database unavailable", "code": "DB_UNAVAILABLE"}}
+            },
+        },
+    },
+)
 async def health() -> dict[str, str] | JSONResponse:
     """Return 200 when the database is reachable, otherwise 503 ``DB_UNAVAILABLE``."""
     try:
