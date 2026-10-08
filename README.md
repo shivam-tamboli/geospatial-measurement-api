@@ -213,6 +213,8 @@ Calling this before processing finishes is `409 FILE_NOT_READY`. For a failed fi
 
 Runs `SELECT 1`. It returns `{"status": "ok"}`, or `503` with `{"detail": "Database unavailable", "code": "DB_UNAVAILABLE"}` when the database can't be reached. I made it 503 rather than 500 because that is what Render's health check and load balancers treat as "not ready".
 
+A Postman collection is included at postman_collection.json — import it, set base_url if needed, and all endpoints are ready to test.
+
 ## Architecture
 
 ### Structure

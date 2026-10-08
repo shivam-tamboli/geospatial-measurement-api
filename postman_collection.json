@@ -1,0 +1,214 @@
+{
+  "info": {
+    "name": "Geospatial Measurement API",
+    "description": "Upload a Shapefile (.zip) or KML file and get the area (m²) of every polygon and the length (m) of every line, measured after reprojecting to the UTM zone of each feature.\n\n**Setup:** the `base_url` variable points at the hosted deployment. Change it to `http://localhost:8000` to test a local instance. `file_id` is filled in automatically when you run an upload request.\n\n**Typical flow:** Health Check → Upload Shapefile or Upload KML → Get File Info (repeat until `COMPLETED`) → Get Measurements. The hosted service runs on a free tier and sleeps when idle, so the first request can take up to a minute.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://geospatial-measurement-api-zthu.onrender.com",
+      "type": "string"
+    },
+    {
+      "key": "file_id",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Checks that the service is up and can reach its database (it runs `SELECT 1`).\n\n**What to set:** nothing. Run this first; on the hosted free tier it also wakes the service up.\n\n**What comes back:** `200` with the body below. If the database is unreachable you get `503` with `{\"detail\": \"Database unavailable\", \"code\": \"DB_UNAVAILABLE\"}`.\n\n**Example response (200):**\n\n```json\n{\n  \"status\": \"ok\"\n}\n```"
+      },
+      "response": []
+    },
+    {
+      "name": "List Files",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/files/?page=1&page_size=20",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "files",
+            ""
+          ],
+          "query": [
+            {
+              "key": "page",
+              "value": "1"
+            },
+            {
+              "key": "page_size",
+              "value": "20"
+            }
+          ]
+        },
+        "description": "Lists uploaded files, newest first, one page at a time.\n\n**What to set:** `page` (1-based, default 1) and `page_size` (default 20, maximum 100) in the query params. Copy an `id` from the result into the `file_id` variable to inspect that file.\n\n**What comes back:** `200` with the pagination totals and a compact entry per file. An empty database returns `total: 0` and an empty `items` list. `page_size` over 100 or `page` below 1 gives `422 VALIDATION_ERROR`.\n\n**Example response (200):**\n\n```json\n{\n  \"page\": 1,\n  \"page_size\": 20,\n  \"total\": 1,\n  \"total_pages\": 1,\n  \"items\": [\n    {\n      \"id\": \"8e4bcba8-dfcc-4609-b116-718620bb14b3\",\n      \"filename\": \"survey.kml\",\n      \"status\": \"COMPLETED\",\n      \"feature_count\": 3,\n      \"crs\": \"EPSG:4326\",\n      \"created_at\": \"2026-10-08T23:25:24.191828Z\"\n    }\n  ]\n}\n```"
+      },
+      "response": []
+    },
+    {
+      "name": "Upload Shapefile",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Saves the new file's id into the collection variable `file_id`, so Get File Info and",
+              "// Get Measurements work straight away.",
+              "if (pm.response.code === 202) {",
+              "    pm.collectionVariables.set('file_id', pm.response.json().id);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": [],
+              "description": "A .zip containing a Shapefile (.shp, .shx, .dbf, .prj)."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/files/",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "files",
+            ""
+          ]
+        },
+        "description": "Uploads a Shapefile packaged as a ZIP archive.\n\n**What to set:** in the Body tab, click the `file` field and choose a file from your computer. Only a `.zip` that contains the Shapefile parts (`.shp`, `.shx`, `.dbf`) and a `.prj` that declares the CRS. Without a `.prj` the file fails with a message asking for one is accepted.\n\n**What comes back:** `202 Accepted` straight away with status `PENDING`. Nothing has been measured yet: parsing runs in the background. The test script on this request saves the returned `id` into the `file_id` collection variable, so you can run **Get File Info** next and repeat it until `status` is `COMPLETED` or `FAILED`.\n\n**Example response (202):**\n\n```json\n{\n  \"id\": \"8e4bcba8-dfcc-4609-b116-718620bb14b3\",\n  \"filename\": \"survey.kml\",\n  \"status\": \"PENDING\"\n}\n```\n\n**Errors:** `400 INVALID_FILE_TYPE` (wrong extension or content), `400 EMPTY_FILE`, `413 FILE_TOO_LARGE` (limit is 50 MB by default), `422 CORRUPT_FILE` (not a valid ZIP, no `.shp` inside, or no `<kml>` element). Every error body is `{\"detail\": \"...\", \"code\": \"...\"}`."
+      },
+      "response": []
+    },
+    {
+      "name": "Upload KML",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Saves the new file's id into the collection variable `file_id`, so Get File Info and",
+              "// Get Measurements work straight away.",
+              "if (pm.response.code === 202) {",
+              "    pm.collectionVariables.set('file_id', pm.response.json().id);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": [],
+              "description": "A .kml file."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/files/",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "files",
+            ""
+          ]
+        },
+        "description": "Uploads a KML file.\n\n**What to set:** in the Body tab, click the `file` field and choose a file from your computer. Only a `.kml` file. KMZ is not supported. Every folder in the KML is read, and a folder that cannot be read is skipped and reported in `warnings` on Get File Info is accepted.\n\n**What comes back:** `202 Accepted` straight away with status `PENDING`. Nothing has been measured yet: parsing runs in the background. The test script on this request saves the returned `id` into the `file_id` collection variable, so you can run **Get File Info** next and repeat it until `status` is `COMPLETED` or `FAILED`.\n\n**Example response (202):**\n\n```json\n{\n  \"id\": \"8e4bcba8-dfcc-4609-b116-718620bb14b3\",\n  \"filename\": \"survey.kml\",\n  \"status\": \"PENDING\"\n}\n```\n\n**Errors:** `400 INVALID_FILE_TYPE` (wrong extension or content), `400 EMPTY_FILE`, `413 FILE_TOO_LARGE` (limit is 50 MB by default), `422 CORRUPT_FILE` (not a valid ZIP, no `.shp` inside, or no `<kml>` element). Every error body is `{\"detail\": \"...\", \"code\": \"...\"}`."
+      },
+      "response": []
+    },
+    {
+      "name": "Get File Info",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/files/{{file_id}}/",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "files",
+            "{{file_id}}",
+            ""
+          ]
+        },
+        "description": "Returns a file's status and metadata. This is the request to repeat after an upload.\n\n**What to set:** the `file_id` collection variable (set automatically by the upload requests, or paste an id from List Files). The URL ends in a slash on purpose: without it the server answers with a redirect.\n\n**What comes back:** `200` with the status, which moves `PENDING` → `PROCESSING` → `COMPLETED` or `FAILED`. `feature_count` and `crs` are `null` until it completes. `error` explains a `FAILED` file. `warnings` lists parts of a `COMPLETED` file that were skipped. `crs` is `EPSG:<code>` only for an exact match, otherwise `CUSTOM:` followed by the start of its WKT. An unknown id gives `404 FILE_NOT_FOUND`; a malformed id gives `422 VALIDATION_ERROR`.\n\n**Example response (200):**\n\n```json\n{\n  \"id\": \"8e4bcba8-dfcc-4609-b116-718620bb14b3\",\n  \"filename\": \"survey.kml\",\n  \"feature_count\": 3,\n  \"crs\": \"EPSG:4326\",\n  \"status\": \"COMPLETED\",\n  \"error\": null,\n  \"warnings\": [],\n  \"file_size\": 557,\n  \"created_at\": \"2026-10-08T23:25:24.191828Z\",\n  \"updated_at\": \"2026-10-08T23:25:24Z\"\n}\n```"
+      },
+      "response": []
+    },
+    {
+      "name": "Get Measurements",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/files/{{file_id}}/measurements/?page=1&page_size=50",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "files",
+            "{{file_id}}",
+            "measurements",
+            ""
+          ],
+          "query": [
+            {
+              "key": "page",
+              "value": "1"
+            },
+            {
+              "key": "page_size",
+              "value": "50"
+            }
+          ]
+        },
+        "description": "Returns the features of a completed file with their geometry, attributes and measurement.\n\n**What to set:** the `file_id` variable, plus `page` (default 1) and `page_size` (default 50, maximum 500). Only call it once Get File Info says `COMPLETED`.\n\n**What comes back:** `200` with features ordered by `feature_id`. `geometry` is WKT in the file's original CRS; `geometry_geojson` is the same geometry in WGS84 for maps. `measurement` holds the area (m²) or length (m) and the UTM zone it was computed in. Points get a measurement whose fields are all `null`. Before processing finishes you get `409 FILE_NOT_READY`; for a failed file, `422 FILE_PROCESSING_FAILED` with the reason.\n\n**Example response (200):**\n\n```json\n{\n  \"file_id\": \"8e4bcba8-dfcc-4609-b116-718620bb14b3\",\n  \"page\": 1,\n  \"page_size\": 50,\n  \"total\": 3,\n  \"total_pages\": 1,\n  \"items\": [\n    {\n      \"feature_id\": 0,\n      \"geometry_type\": \"Polygon\",\n      \"geometry\": \"POLYGON Z ((77 28 0, 77.01 28 0, 77.01 28.01 0, 77 28.01 0, 77 28 0))\",\n      \"geometry_geojson\": {\n        \"type\": \"Polygon\",\n        \"coordinates\": [\n          [\n            [\n              77.0,\n              28.0\n            ],\n            [\n              77.01,\n              28.0\n            ],\n            [\n              77.01,\n              28.01\n            ],\n            [\n              77.0,\n              28.01\n            ],\n            [\n              77.0,\n              28.0\n            ]\n          ]\n        ]\n      },\n      \"crs\": \"EPSG:4326\",\n      \"properties\": {\n        \"Name\": \"Poly\",\n        \"Description\": \"\"\n      },\n      \"measurement\": {\n        \"type\": \"area\",\n        \"value\": 1090165.1617245723,\n        \"unit\": \"m²\",\n        \"projected_crs\": \"EPSG:32643\"\n      }\n    },\n    {\n      \"feature_id\": 1,\n      \"geometry_type\": \"LineString\",\n      \"geometry\": \"LINESTRING (77 28, 77.01 28)\",\n      \"geometry_geojson\": {\n        \"type\": \"LineString\",\n        \"coordinates\": [\n          [\n            77.0,\n            28.0\n          ],\n          [\n            77.01,\n            28.0\n          ]\n        ]\n      },\n      \"crs\": \"EPSG:4326\",\n      \"properties\": {\n        \"Name\": \"Line\",\n        \"Description\": \"\"\n      },\n      \"measurement\": {\n        \"type\": \"length\",\n        \"value\": 983.6971724179657,\n        \"unit\": \"m\",\n        \"projected_crs\": \"EPSG:32643\"\n      }\n    },\n    {\n      \"feature_id\": 2,\n      \"geometry_type\": \"Point\",\n      \"geometry\": \"POINT (77 28)\",\n      \"geometry_geojson\": {\n        \"type\": \"Point\",\n        \"coordinates\": [\n          77.0,\n          28.0\n        ]\n      },\n      \"crs\": \"EPSG:4326\",\n      \"properties\": {\n        \"Name\": \"Pt\",\n        \"Description\": \"\"\n      },\n      \"measurement\": {\n        \"type\": null,\n        \"value\": null,\n        \"unit\": null,\n        \"projected_crs\": null\n      }\n    }\n  ]\n}\n```"
+      },
+      "response": []
+    }
+  ]
+}
