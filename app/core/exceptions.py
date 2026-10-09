@@ -37,6 +37,11 @@ class EmptyFileError(AppError):
     code = "EMPTY_FILE"
 
 
+class PageSizeTooLargeError(AppError):
+    status_code = status.HTTP_400_BAD_REQUEST
+    code = "PAGE_SIZE_TOO_LARGE"
+
+
 class FileTooLargeError(AppError):
     status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
     code = "FILE_TOO_LARGE"

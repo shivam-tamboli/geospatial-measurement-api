@@ -59,6 +59,7 @@ class Settings:
     max_zip_members: int
     default_page_size: int
     max_page_size: int
+    processing_batch_size: int
     list_default_page_size: int
     list_max_page_size: int
     allowed_origins: tuple[str, ...]
@@ -93,8 +94,9 @@ def _load_settings() -> Settings:
         max_upload_size_mb=_env_int("MAX_UPLOAD_SIZE_MB", 50),
         max_extracted_size_mb=_env_int("MAX_EXTRACTED_SIZE_MB", 500),
         max_zip_members=_env_int("MAX_ZIP_MEMBERS", 200),
-        default_page_size=_env_int("DEFAULT_PAGE_SIZE", 50),
-        max_page_size=_env_int("MAX_PAGE_SIZE", 500),
+        default_page_size=_env_int("DEFAULT_PAGE_SIZE", 20),
+        max_page_size=_env_int("MAX_PAGE_SIZE", 100),
+        processing_batch_size=max(1, _env_int("PROCESSING_BATCH_SIZE", 50)),
         list_default_page_size=_env_int("LIST_DEFAULT_PAGE_SIZE", 20),
         list_max_page_size=_env_int("LIST_MAX_PAGE_SIZE", 100),
         allowed_origins=_parse_origins(os.getenv("ALLOWED_ORIGINS"), environment),

@@ -3,8 +3,8 @@ import { useEffect, useMemo } from 'react'
 import { getMeasurements, type ApiError } from '../api/client'
 import type { FeatureMeasurement, MeasurementsPage } from '../api/types'
 
-// Kept below the API's default MAX_PAGE_SIZE (500) so a stricter server setting still works.
-const MAP_PAGE_SIZE = 200
+// The API rejects page_size above its MAX_PAGE_SIZE (default 100) with a 400, so this must not exceed it.
+const MAP_PAGE_SIZE = 100
 /** Upper bound on features drawn on the map; keeps the browser responsive for huge files. */
 export const MAX_MAP_FEATURES = 5000
 

@@ -219,7 +219,7 @@ class MeasurementsPage(BaseModel):
                 {
                     "file_id": _FILE_ID,
                     "page": 1,
-                    "page_size": 50,
+                    "page_size": 20,
                     "total": 3,
                     "total_pages": 1,
                     "items": [_POLYGON_ITEM, _POINT_ITEM],
@@ -230,7 +230,7 @@ class MeasurementsPage(BaseModel):
 
     file_id: uuid.UUID = Field(examples=[_FILE_ID])
     page: int = Field(description="Current 1-based page number.", examples=[1])
-    page_size: int = Field(description="Maximum items per page.", examples=[50])
+    page_size: int = Field(description="Maximum items per page.", examples=[20])
     total: int = Field(description="Total number of features in the file.", examples=[3])
     total_pages: int = Field(description="Number of pages; 0 when the file has no features.", examples=[1])
     items: list[FeatureMeasurement]

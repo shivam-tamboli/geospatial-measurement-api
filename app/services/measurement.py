@@ -106,7 +106,8 @@ def measure_geometries(
     """Measure many geometries that share one source CRS, with one PROJ call per UTM zone.
 
     Equivalent to calling :func:`measure_geometry` on each geometry (and tested to match it),
-    but without two Python-level transforms per feature:
+    but without two Python-level transforms per feature. Everything here is held in memory at once,
+    so callers pass a bounded batch (``PROCESSING_BATCH_SIZE``) rather than a whole file:
 
     1. every geometry is reprojected to WGS84 in one call (skipped if ``wgs84_geometries`` is given),
     2. centroids and UTM zones are computed with numpy,
