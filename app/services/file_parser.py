@@ -20,7 +20,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from pyproj import CRS
-from shapely.geometry import Point
+from shapely.errors import ShapelyError
+from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
 
 from app.core.exceptions import CorruptFileError
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 fiona.drvsupport.supported_drivers["KML"] = "rw"
 
 _COPY_CHUNK = 1024 * 1024
+_MAX_FEATURE_WARNINGS = 10  # per-feature geometry warnings kept verbatim; the rest are summarised in one line
 
 
 class _UnopenableLayerName(Exception):
@@ -163,9 +165,10 @@ def _read_sources(
     """
     features: list[ParsedFeature] = []
     warnings: list[str] = []
+    unbuildable: list[str] = []
     for index, (src_path, layer) in enumerate(sources):
         try:
-            gdf = _read_layer(src_path, layer, index, driver, by_position)
+            gdf = _load_layer(src_path, layer, index, driver, by_position)
         except _UnopenableLayerName:
             raise
         except Exception as exc:  # noqa: BLE001 - Fiona/pyogrio/GDAL raise many unrelated types
@@ -187,11 +190,46 @@ def _read_sources(
                 f"'{src_path.name}' does not declare a coordinate reference system (missing .prj). "
                 "Include the .prj file in the ZIP."
             )
-        features.extend(_to_features(gdf, crs, start_index=len(features)))
-    return features, warnings
+        layer_features = _to_features(gdf, crs, start_index=len(features))
+        for offset, (geometry_type, reason) in gdf.attrs.get("geometry_problems", {}).items():
+            layer_features[offset].geometry_type = geometry_type  # keep the real type, not "None"
+            unbuildable.append(f"Feature {layer_features[offset].index}: {reason} — skipped (geometry set to null)")
+        features.extend(layer_features)
+    return features, warnings + _summarise_warnings(unbuildable)
 
 
-def _read_layer(path: Path, layer: str | None, index: int, driver: str | None, by_position: bool) -> gpd.GeoDataFrame:
+def _summarise_warnings(messages: list[str]) -> list[str]:
+    """Keep the first few per-feature warnings; summarise the rest so a bad file can't produce thousands."""
+    if len(messages) <= _MAX_FEATURE_WARNINGS:
+        return messages
+    extra = len(messages) - _MAX_FEATURE_WARNINGS
+    return messages[:_MAX_FEATURE_WARNINGS] + [f"...and {extra} more features had geometries that could not be built."]
+
+
+def _load_layer(path: Path, layer: str | None, index: int, driver: str | None, by_position: bool) -> gpd.GeoDataFrame:
+    """Read a layer; if a geometry cannot be built, re-read it feature by feature instead of failing it.
+
+    GeoPandas builds every Shapely geometry while reading, and Shapely cannot represent some things
+    GDAL happily reports, most commonly a LineString with a single point (``GEOSException: point
+    array must contain 0 or >1 elements``). One such feature then raises out of ``read_file`` and the
+    whole layer is lost. Only errors of that kind trigger the slower per-feature path, so a normal
+    file takes the normal route and a genuine driver failure still fails as before.
+    """
+    try:
+        return _read_layer(path, layer, index, driver, by_position)
+    except (ValueError, ShapelyError) as exc:
+        if isinstance(exc, _UnopenableLayerName):
+            raise
+        logger.info(
+            "Layer read failed while building geometries; retrying feature by feature",
+            extra={"source": path.name, "layer": layer, "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return _read_layer(path, layer, index, driver, by_position, tolerant=True)
+
+
+def _read_layer(
+    path: Path, layer: str | None, index: int, driver: str | None, by_position: bool, tolerant: bool = False
+) -> gpd.GeoDataFrame:
     """Read one layer with Fiona.
 
     A KML whose placemarks sit directly under ``<Document>`` (no ``<Folder>``), or whose folders have
@@ -210,23 +248,73 @@ def _read_layer(path: Path, layer: str | None, index: int, driver: str | None, b
         index: Position of ``layer`` among the file's layers.
         driver: Fiona driver name (``"KML"``) or ``None`` to auto-detect (Shapefile).
         by_position: Read by position instead of by name.
+        tolerant: Build geometries one at a time and null the ones that cannot be built.
 
     Raises:
         _UnopenableLayerName: The name cannot be opened (KML only, and only when ``by_position`` is off).
     """
-    kwargs: dict[str, Any] = {"engine": "fiona"}
-    if driver:
-        kwargs["driver"] = driver
+    base: dict[str, Any] = {"driver": driver} if driver else {}
+
+    def read(**extra: Any) -> gpd.GeoDataFrame:
+        if tolerant:
+            return _read_features_tolerant(path, **base, **extra)
+        return gpd.read_file(path, engine="fiona", **base, **extra)
+
     if layer is None or (by_position and index == 0):
-        return gpd.read_file(path, **kwargs)
+        return read()
     if by_position:
-        return gpd.read_file(path, layer=index, **kwargs)
+        return read(layer=index)
     try:
-        return gpd.read_file(path, layer=layer, **kwargs)
+        return read(layer=layer)
     except ValueError as exc:
         if driver == "KML" and "Null layer" in str(exc):
             raise _UnopenableLayerName(layer) from exc
         raise
+
+
+def _read_features_tolerant(path: Path, *, driver: str | None = None, layer: str | int | None = None) -> gpd.GeoDataFrame:
+    """Read a layer feature by feature, replacing any geometry Shapely cannot build with ``None``.
+
+    The frame is assembled by the same ``GeoDataFrame.from_features`` call GeoPandas uses, from
+    records whose bad geometries have already been removed, so the result looks like a normal read.
+    The unbuildable ones are recorded in ``gdf.attrs["geometry_problems"]`` as
+    ``{row offset: (geometry type, reason)}``.
+    """
+    kwargs: dict[str, Any] = {}
+    if driver:
+        kwargs["driver"] = driver
+    if layer is not None:
+        kwargs["layer"] = layer
+    problems: dict[int, tuple[str, str]] = {}
+    with fiona.open(path, **kwargs) as source:
+        epsg = source.crs.to_epsg(confidence_threshold=100)  # same CRS resolution as geopandas.read_file
+        crs: Any = epsg if epsg is not None else (source.crs_wkt or None)
+        columns = list(source.schema["properties"])
+        records = []
+        for offset, record in enumerate(source):
+            feature = dict(record.__geo_interface__)
+            geometry = feature.get("geometry")
+            if geometry:
+                try:
+                    shape(geometry)
+                except (ValueError, ShapelyError) as exc:
+                    problems[offset] = (str(geometry.get("type", "Geometry")), _describe_unbuildable(geometry, exc))
+                    feature["geometry"] = None
+            records.append(feature)
+    gdf = gpd.GeoDataFrame.from_features(records, crs=crs, columns=columns + ["geometry"])
+    gdf.attrs["geometry_problems"] = problems
+    return gdf
+
+
+def _describe_unbuildable(geometry: dict[str, Any], exc: Exception) -> str:
+    """Human-readable reason a GeoJSON-like geometry could not be turned into a Shapely geometry."""
+    kind = str(geometry.get("type", "Geometry"))
+    coordinates = geometry.get("coordinates") or []
+    if kind == "LineString" and len(coordinates) < 2:
+        return "LineString has fewer than 2 points"
+    if kind == "MultiLineString" and any(len(part) < 2 for part in coordinates):
+        return "MultiLineString has a part with fewer than 2 points"
+    return f"{kind} geometry could not be built ({str(exc)[:80]})"
 
 
 def _to_features(gdf: gpd.GeoDataFrame, crs: CRS, start_index: int) -> list[ParsedFeature]:

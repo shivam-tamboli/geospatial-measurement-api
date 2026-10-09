@@ -42,6 +42,17 @@ class MeasurementResult:
 NO_MEASUREMENT = MeasurementResult()
 
 
+def _has_degenerate_line(geometry: BaseGeometry) -> bool:
+    """True if the geometry is, or contains, a LineString with fewer than 2 points.
+
+    Shapely itself refuses to build such a line, so with Shapely objects this is never true. It is a
+    cheap guard for geometry that did not come through Shapely's constructors (a different reader,
+    a test double), where measuring would otherwise hand PROJ an unusable line.
+    """
+    parts = getattr(geometry, "geoms", None) or [geometry]
+    return any(part.geom_type == "LineString" and len(part.coords) < 2 for part in parts)
+
+
 def measure_geometry(geometry: BaseGeometry | None, source_crs: CRS, feature_index: int | None = None) -> MeasurementResult:
     """Measure a geometry in metres / square metres.
 
@@ -69,6 +80,9 @@ def measure_geometry(geometry: BaseGeometry | None, source_crs: CRS, feature_ind
         return NO_MEASUREMENT
     if geom_type not in _AREA_TYPES | _LENGTH_TYPES:
         logger.warning("Unsupported geometry type for measurement", extra={**log_ctx, "geometry_type": geom_type})
+        return NO_MEASUREMENT
+    if _has_degenerate_line(geometry):
+        logger.warning("LineString has fewer than 2 points; skipping measurement", extra=log_ctx)
         return NO_MEASUREMENT
 
     try:
@@ -119,6 +133,9 @@ def measure_geometries(
         if geom is None or geom.is_empty:
             logger.warning("Feature has no geometry; skipping measurement", extra={"feature_index": feature_indexes[pos]})
         elif geom.geom_type in _AREA_TYPES | _LENGTH_TYPES:
+            if _has_degenerate_line(geom):
+                logger.warning("LineString has fewer than 2 points; skipping measurement", extra={"feature_index": feature_indexes[pos]})
+                continue
             measurable[pos] = geom
         elif geom.geom_type not in _NO_MEASUREMENT_TYPES:
             logger.warning(
