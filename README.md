@@ -73,7 +73,8 @@ Everything comes from environment variables, loaded from `.env` by python-dotenv
 - `UPLOAD_DIR` (default `uploads`): where raw uploads are stored, under a UUID filename.
 - `MAX_UPLOAD_SIZE_MB` (default 50): the upload limit. A request whose `Content-Length` is over it (plus a 64 KB allowance for multipart framing) is refused before the body is read; chunked requests are checked while streaming.
 - `MAX_EXTRACTED_SIZE_MB` (default 500) and `MAX_ZIP_MEMBERS` (default 200): zip-bomb limits applied while extracting a Shapefile archive.
-- `DEFAULT_PAGE_SIZE` (default 50) and `MAX_PAGE_SIZE` (default 500): pagination for measurements.
+- `DEFAULT_PAGE_SIZE` (default 20) and `MAX_PAGE_SIZE` (default 100): pagination for measurements. A `page_size` above the maximum is rejected with `400`, not capped.
+- `PROCESSING_BATCH_SIZE` (default 50): how many features are measured and written to the database at a time. It bounds the memory the measuring step adds; see "Background tasks".
 - `LIST_DEFAULT_PAGE_SIZE` (default 20) and `LIST_MAX_PAGE_SIZE` (default 100): pagination for the file listing.
 - `ALLOWED_ORIGINS`: comma-separated CORS origins. If unset, it is `*` in development and CORS is off otherwise.
 - `FRONTEND_DIST_DIR` (default `frontend/dist`): the built frontend to serve at `/`.
@@ -158,7 +159,7 @@ curl "http://localhost:8000/api/files/?page=1&page_size=2"
 
 ### GET /api/files/{id}/measurements/
 
-Returns the features of a completed file, ordered by `feature_id`, one page at a time. Query parameters: `page` (default 1) and `page_size` (default 50, maximum 500).
+Returns the features of a completed file, ordered by `feature_id`, one page at a time. Query parameters: `page` (default 1) and `page_size` (default 20, maximum 100). A larger `page_size` is rejected with `400 PAGE_SIZE_TOO_LARGE` rather than silently capped, so a client never receives fewer rows than it asked for without knowing.
 
 ```bash
 curl "http://localhost:8000/api/files/8e4bcba8-dfcc-4609-b116-718620bb14b3/measurements/?page_size=3"
@@ -238,7 +239,7 @@ background task process_file(id)            (runs after the response is sent)
   status -> PROCESSING (own commit, so pollers see it)
   in a worker thread:
     ZIP: extract safely, read each .shp  |  KML: read each layer
-    group features by source CRS
+    in batches of PROCESSING_BATCH_SIZE (default 50): group features by source CRS
       one call: all geometries -> WGS84; centroids and UTM zones in numpy
       group by UTM zone; one reprojection call per group; vectorised area/length
       build GeoJSON from the WGS84 geometries
@@ -249,6 +250,8 @@ background task process_file(id)            (runs after the response is sent)
 ### Background tasks
 
 Processing uses FastAPI's `BackgroundTasks`, which runs the job in the same process after the response is sent. The job opens its own database session, because the request's session is gone by then. GeoPandas, GDAL and PROJ are synchronous and CPU-heavy, so the parse and measure step runs in `asyncio.to_thread`; run inline, it would freeze every other request for the length of a big file.
+
+Measuring and storing are done in batches of `PROCESSING_BATCH_SIZE` features (50 by default). Each batch is reprojected, measured, inserted, and dropped before the next is built, inside the one transaction that is committed together with the `COMPLETED` status. I added this after measuring a 20,000-polygon file: building every row at once pushed the process to 913 MB, while batching kept it at 321 MB, which is just the cost of parsing. With a 512 MB container limit the batched run completed (about 253 MiB sampled) and the all-at-once run was killed and restarted. The trade-off is speed on files scattered over many UTM zones, because features are only grouped by zone within a batch: on 30,000 features spread over about 50 zones, batch 50 ran at 18,700 features/s against 51,000 for one big batch, while batch 500 matched it (47,000/s) with the same memory profile. If throughput matters more than headroom, raise `PROCESSING_BATCH_SIZE` to 500.
 
 The job never raises. Domain errors become a `FAILED` status with their own message; anything unexpected is logged with a traceback and stored as a generic message, so a client never sees an internal error. The features and the `COMPLETED` status are written in one transaction, which means a poller can't see a half-ingested file.
 
@@ -289,7 +292,7 @@ The limitation, which I would rather state than hide: UTM preserves shape, not a
 
 **Compute once at ingest and store, instead of computing on read.** Measurements, WKT and the WGS84 GeoJSON are all computed during processing and stored, so the read endpoints are plain paginated queries. The cost is extra storage, since every feature carries two copies of its geometry. I didn't use PostGIS geometry columns, because nothing here needs a spatial query, and PostGIS would complicate every local setup.
 
-**Grouping features by UTM zone and reprojecting each group in one call.** My first version transformed each feature on its own, twice: once to WGS84 to find its zone, then again into UTM. The current version reprojects every geometry to WGS84 in one GeoPandas call, computes all the centroids and zones with numpy, groups features by zone, and does one reprojection per group. Results are identical, and a test asserts that, plus a spy that asserts the number of PROJ calls equals the number of zones. On 30,000 synthetic features spread over many zones, on my laptop, the file-to-rows step dropped from 2.43 s to 0.49 s; 100,000 features take 1.64 s. If a whole group fails, that group is retried feature by feature, so one bad geometry still can't take its neighbours down.
+**Grouping features by UTM zone and reprojecting each group in one call.** My first version transformed each feature on its own, twice: once to WGS84 to find its zone, then again into UTM. The current version reprojects every geometry to WGS84 in one GeoPandas call, computes all the centroids and zones with numpy, groups features by zone, and does one reprojection per group. Results are identical, and a test asserts that, plus a spy that asserts the number of PROJ calls equals the number of zones. On 30,000 synthetic features spread over many zones, on my laptop, the file-to-rows step dropped from 2.43 s to 0.49 s; 100,000 features take 1.64 s. Those figures were measured with the whole file in one batch; the default batch of 50 is slower on data spread over many zones (see "Background tasks"). If a whole group fails, that group is retried feature by feature, so one bad geometry still can't take its neighbours down.
 
 **Cheap validation at upload, real parsing in the background.** Wrong extension, mismatched content, empty file, oversize, and a ZIP with no `.shp` all fail immediately with a 4xx, so the common mistakes get fast feedback. Everything that needs GDAL happens in the background and surfaces as `FAILED`. The alternative, parsing synchronously, gives a simpler contract but ties up a request for however long a large file takes and invites proxy timeouts.
 
@@ -306,7 +309,7 @@ The limitation, which I would rather state than hide: UTM preserves shape, not a
 - Features that span several UTM zones are measured less accurately, as described above. Nothing in the response says so.
 - There is no authentication or rate limiting. Anyone who can reach the API can upload.
 - The Content-Length guard can't see the size of chunked uploads. Those are streamed to disk until the limit is hit, then cleaned up. In production I would also set a body-size limit at the proxy.
-- GeoPandas reads a whole file into memory, so very large files need a lot of RAM.
+- Parsing reads the whole file into memory (GeoPandas builds every geometry up front), so very large files still need a lot of RAM: a 17.6 MB zip of 20,000 polygons with 101 vertices each peaked at about 320 MB during parsing alone. Only the measuring step is batched, so it adds almost nothing on top of that instead of adding another 560 MB.
 - Self-intersecting (bow-tie) polygons return an incorrect area. Shapely does not validate geometry before measuring, and the service does not reject such polygons. Real-world files rarely contain them, but when one does the number is wrong and the only signal is a log line: a 0.01° bow-tie measured 2.6 m² where its true area is about 540,000 m².
 - Coordinates outside valid ranges (longitude beyond ±180°, latitude beyond ±90°) are accepted. They may produce a null measurement or GeoJSON with invalid coordinates, and nothing in the response says so. Validation at the geometry level is not implemented.
 - Polygons that cross the antimeridian (±180° longitude) are not split in the GeoJSON output, so map libraries may render them incorrectly.

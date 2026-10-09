@@ -12,6 +12,10 @@ os.environ["UPLOAD_DIR"] = f"{_TMP}/uploads"
 os.environ["LOG_LEVEL"] = "WARNING"
 os.environ["LOG_FORMAT"] = "console"
 os.environ["MAX_UPLOAD_SIZE_MB"] = "1"
+# Pin everything the tests assert on, so a developer's local .env cannot change the results.
+os.environ["DEFAULT_PAGE_SIZE"] = "20"
+os.environ["MAX_PAGE_SIZE"] = "100"
+os.environ["PROCESSING_BATCH_SIZE"] = "50"
 os.environ["FRONTEND_DIST_DIR"] = f"{_TMP}/no-frontend"  # a local frontend/dist build must not shadow API 404s
 
 import httpx  # noqa: E402

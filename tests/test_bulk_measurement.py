@@ -22,7 +22,7 @@ from app.services.crs_handler import (
     utm_epsg_for_lonlat,
     utm_epsgs_for_lonlat,
 )
-from app.services.file_parser import ParsedFeature, ParsedFile
+from app.services.file_parser import ParsedFeature
 from app.services.file_service import _build_feature_rows
 from app.services.measurement import measure_geometries, measure_geometry
 
@@ -205,7 +205,7 @@ def test_build_feature_rows_batches_by_crs_but_preserves_feature_order() -> None
         ParsedFeature(2, a, "Polygon", a.wkt, WGS84, {"n": 2}),
         ParsedFeature(3, None, "None", None, utm, {"n": 3}),
     ]
-    rows = _build_feature_rows(uuid.uuid4(), ParsedFile("EPSG:4326, EPSG:32643", features))
+    rows = _build_feature_rows(uuid.uuid4(), features)
 
     assert [r["feature_index"] for r in rows] == [0, 1, 2, 3]
     assert [r["crs"] for r in rows] == ["EPSG:4326", "EPSG:32643", "EPSG:4326", "EPSG:32643"]

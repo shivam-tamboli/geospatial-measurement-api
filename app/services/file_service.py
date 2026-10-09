@@ -10,6 +10,7 @@ import asyncio
 import logging
 import math
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from app.core.exceptions import (
     FileProcessingFailedError,
     FileTooLargeError,
     InvalidFileTypeError,
+    PageSizeTooLargeError,
     UploadedFileNotFoundError,
 )
 from app.db.session import async_session_factory
@@ -39,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = frozenset({".zip", ".kml"})
 _UPLOAD_CHUNK = 1024 * 1024
-_INSERT_BATCH = 1000
 _GENERIC_FAILURE = "Processing failed due to an unexpected internal error."
 _INTERRUPTED_REASON = "Service restarted before processing completed"
 
@@ -124,16 +125,17 @@ async def create_upload(session: AsyncSession, upload: UploadFile, settings: Set
 # ------------------------------------------------------------------------ processing
 
 
-def _build_feature_rows(file_id: uuid.UUID, parsed: ParsedFile) -> list[dict[str, Any]]:
-    """Measure every parsed feature and shape it into DB rows (CPU-bound; run off the event loop).
+def _build_feature_rows(file_id: uuid.UUID, features: list[ParsedFeature]) -> list[dict[str, Any]]:
+    """Measure a batch of parsed features and shape it into DB rows (CPU-bound; run off the event loop).
 
-    Features are batched by source CRS (normally just one) so that reprojection and measurement
-    use the bulk, per-UTM-zone functions instead of transforming feature by feature.
+    The batch is grouped by source CRS (normally just one) so that reprojection and measurement
+    use the bulk, per-UTM-zone functions instead of transforming feature by feature. Memory use
+    scales with the batch, not with the file: see :func:`process_file`.
     """
     # The parser gives every feature from one source the same CRS object, so identity grouping is
     # safe, and it avoids hashing a CRS (which serialises it to WKT) once per feature.
     batches: dict[int, tuple[CRS, list[ParsedFeature]]] = {}
-    for feat in parsed.features:
+    for feat in features:
         batches.setdefault(id(feat.crs), (feat.crs, []))[1].append(feat)
 
     rows: list[dict[str, Any]] = []
@@ -163,9 +165,8 @@ def _build_feature_rows(file_id: uuid.UUID, parsed: ParsedFile) -> list[dict[str
     return rows
 
 
-def _parse_and_measure(file_id: uuid.UUID, path: Path, settings: Settings) -> tuple[ParsedFile, list[dict[str, Any]]]:
-    parsed = parse_geospatial_file(path, path.suffix.lower(), settings.max_extracted_bytes, settings.max_zip_members)
-    return parsed, _build_feature_rows(file_id, parsed)
+def _parse(path: Path, settings: Settings) -> ParsedFile:
+    return parse_geospatial_file(path, path.suffix.lower(), settings.max_extracted_bytes, settings.max_zip_members)
 
 
 async def _mark_failed(session_factory: async_sessionmaker[AsyncSession], file_id: uuid.UUID, reason: str) -> None:
@@ -185,8 +186,13 @@ async def process_file(
     """Background job: parse the stored file, measure features and persist the results.
 
     Never raises: any failure is logged and recorded as ``FAILED`` on the file record.
-    Features and the ``COMPLETED`` status are written in one transaction, so a file
-    is never observed half-processed.
+
+    Features are measured and written in batches of ``settings.processing_batch_size``: each batch is
+    reprojected, measured, inserted, and then dropped before the next one is built, so the memory
+    added by measuring is bounded by the batch size instead of growing with the file. (Parsing still
+    reads the whole file into memory; that part is not batched.) All batches belong to one
+    transaction that is committed together with the ``COMPLETED`` status, so a file is never
+    observed half-processed and a failure part-way through leaves no features behind.
 
     Args:
         file_id: Primary key of the :class:`UploadedFile` to process.
@@ -208,19 +214,26 @@ async def process_file(
             await session.commit()
             logger.info("Processing started", extra=log_ctx)
 
-            parsed, rows = await asyncio.to_thread(_parse_and_measure, file_id, stored_path, settings)
+            parsed = await asyncio.to_thread(_parse, stored_path, settings)
 
-            for start in range(0, len(rows), _INSERT_BATCH):
-                await session.execute(insert(Feature), rows[start : start + _INSERT_BATCH])
+            pending = deque(parsed.features)
+            parsed.features.clear()  # `pending` is now the only reference, so processed features can be freed
+            feature_count = len(pending)
+            while pending:
+                batch = [pending.popleft() for _ in range(min(settings.processing_batch_size, len(pending)))]
+                rows = await asyncio.to_thread(_build_feature_rows, file_id, batch)
+                del batch  # drop the geometries before the insert, not after the next batch is built
+                await session.execute(insert(Feature), rows)
+                del rows
             record.status = FileStatus.COMPLETED
-            record.feature_count = len(rows)
+            record.feature_count = feature_count
             record.crs = parsed.crs_label
             record.warnings = parsed.warnings
             record.error_message = None
             await session.commit()
         logger.info(
             "Processing completed",
-            extra={**log_ctx, "feature_count": len(rows), "warning_count": len(parsed.warnings)},
+            extra={**log_ctx, "feature_count": feature_count, "warning_count": len(parsed.warnings)},
         )
     except AppError as exc:
         logger.warning("Processing failed", extra={**log_ctx, "reason": exc.detail, "code": exc.code})
@@ -302,10 +315,14 @@ async def list_measurements(session: AsyncSession, file_id: uuid.UUID, page: int
     """Return one page of feature measurements for a completed file.
 
     Raises:
+        PageSizeTooLargeError: ``page_size`` is above ``MAX_PAGE_SIZE`` (checked before anything else).
         UploadedFileNotFoundError: No such file.
         FileNotReadyError: File is still ``PENDING``/``PROCESSING``.
         FileProcessingFailedError: File processing failed (message explains why).
     """
+    max_page_size = get_settings().max_page_size
+    if page_size > max_page_size:
+        raise PageSizeTooLargeError(f"page_size must be at most {max_page_size}.")
     record = await get_file(session, file_id)
     if record.status in (FileStatus.PENDING, FileStatus.PROCESSING):
         raise FileNotReadyError(f"File is still {record.status.value}. Try again shortly.")

@@ -27,9 +27,11 @@ services:
       - key: MAX_ZIP_MEMBERS
         value: "200"
       - key: DEFAULT_PAGE_SIZE
-        value: "50"
+        value: "20"
       - key: MAX_PAGE_SIZE
-        value: "500"
+        value: "100"
+      - key: PROCESSING_BATCH_SIZE
+        value: "50"
       - key: DB_POOL_SIZE
         value: "5"
       - key: DB_MAX_OVERFLOW

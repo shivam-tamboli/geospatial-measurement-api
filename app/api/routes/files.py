@@ -178,6 +178,10 @@ async def get_file_info(
             "No file with this id.",
             not_found=("Unknown id", f"File '{_EXAMPLE_ID}' not found.", "FILE_NOT_FOUND"),
         ),
+        400: _error(
+            "`page_size` is above the maximum.",
+            too_big=("page_size over the limit", f"page_size must be at most {_settings.max_page_size}.", "PAGE_SIZE_TOO_LARGE"),
+        ),
         409: _error(
             "The file is still being processed.",
             not_ready=("Still processing", "File is still PROCESSING. Try again shortly.", "FILE_NOT_READY"),
@@ -199,9 +203,11 @@ async def get_measurements(
     page_size: int = Query(
         _settings.default_page_size,
         ge=1,
-        le=_settings.max_page_size,
-        description=f"Items per page, 1 to {_settings.max_page_size}.",
-        examples=[50],
+        description=(
+            f"Items per page, 1 to {_settings.max_page_size} (default {_settings.default_page_size}). "
+            f"A larger value is rejected with 400, not silently capped."
+        ),
+        examples=[_settings.default_page_size],
     ),
     session: AsyncSession = Depends(get_session),
 ) -> MeasurementsPage:
