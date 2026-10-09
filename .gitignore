@@ -7,8 +7,7 @@ venv/
 .coverage
 htmlcov/
 .DS_Store
-uploads/*
-!uploads/.gitkeep
+uploads/
 
 # Frontend
 frontend/node_modules/
