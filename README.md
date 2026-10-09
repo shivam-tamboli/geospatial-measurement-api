@@ -55,7 +55,7 @@ CORS is open (`*`) when `ENVIRONMENT=development`, so this works without configu
 ### Tests
 
 ```bash
-pytest                      # 87 backend tests, no Postgres needed
+pytest                      # 122 backend tests, no Postgres needed
 cd frontend && npm run build && npm run lint
 ```
 
@@ -83,7 +83,7 @@ Everything comes from environment variables, loaded from `.env` by python-dotenv
 
 ## API
 
-All endpoints are under `/api/files/`. The trailing slashes matter. Without one the request matches no route: you get `404 NOT_FOUND` from any instance that serves the frontend (the Docker image and the Render deployment), and a 307 redirect only from an API-only instance run without `frontend/dist`. I did not add a redirect, because some HTTP clients drop the body of a POST when they follow one. The examples below are captured from a running instance.
+All endpoints are under `/api/files/`. The trailing slashes matter. Without one the request matches no route. Any instance that serves the frontend (the Docker image and the Render deployment) answers a GET with `404 NOT_FOUND` and a POST with `405 METHOD_NOT_ALLOWED`; only an API-only instance run without `frontend/dist` answers with a 307 redirect. I did not add a redirect, because some HTTP clients drop the body of a POST when they follow one. The examples below are captured from a running instance.
 
 Every error, from any endpoint, has the same shape: `{"detail": "...", "code": "..."}`. `detail` is for people; branch on `code`.
 
@@ -128,7 +128,7 @@ curl http://localhost:8000/api/files/8e4bcba8-dfcc-4609-b116-718620bb14b3/
 {"status": "FAILED", "feature_count": null, "crs": null, "error": "'sf.shp' does not declare a coordinate reference system (missing .prj). Include the .prj file in the ZIP.", "warnings": []}
 ```
 
-`warnings` is for partial reads. If one folder of a multi-folder KML can't be parsed, the file still completes, and the skipped folder is named here, for example `["KML layer 'Roads' could not be read and was skipped; its features are missing."]`. An unknown id is `404 FILE_NOT_FOUND`; a malformed id is `422 VALIDATION_ERROR`.
+`warnings` is for partial reads. If one folder of a multi-folder KML can't be parsed, the file still completes, and the skipped folder is named here, for example `["KML layer 'Roads' could not be read and was skipped; its features are missing."]`. A KML point whose coordinates are empty or unparseable is kept as a feature with a null geometry, and the file gets a warning that says how many: `["2 features had empty or unparseable coordinates; the geometry of each was set to null."]`. GDAL would otherwise turn such a point into `POINT (0 0)` without saying anything. An unknown id is `404 FILE_NOT_FOUND`; a malformed id is `422 VALIDATION_ERROR`.
 
 ### GET /api/files/
 
@@ -307,7 +307,10 @@ The limitation, which I would rather state than hide: UTM preserves shape, not a
 - There is no authentication or rate limiting. Anyone who can reach the API can upload.
 - The Content-Length guard can't see the size of chunked uploads. Those are streamed to disk until the limit is hit, then cleaned up. In production I would also set a body-size limit at the proxy.
 - GeoPandas reads a whole file into memory, so very large files need a lot of RAM.
-- Invalid polygons, such as self-intersecting rings, are measured anyway. Shapely's area for them may be wrong, and the only signal is a log line.
+- Self-intersecting (bow-tie) polygons return an incorrect area. Shapely does not validate geometry before measuring, and the service does not reject such polygons. Real-world files rarely contain them, but when one does the number is wrong and the only signal is a log line: a 0.01° bow-tie measured 2.6 m² where its true area is about 540,000 m².
+- Coordinates outside valid ranges (longitude beyond ±180°, latitude beyond ±90°) are accepted. They may produce a null measurement or GeoJSON with invalid coordinates, and nothing in the response says so. Validation at the geometry level is not implemented.
+- Polygons that cross the antimeridian (±180° longitude) are not split in the GeoJSON output, so map libraries may render them incorrectly.
+- `POST /api/files` without a trailing slash returns 405. The correct path is `POST /api/files/`.
 - Schema changes need a manual database reset, because there are no migrations.
 - A ZIP containing Shapefiles in different CRSs reports a comma-joined string in the file-level `crs`. Each feature still has its correct `crs`.
 - KMZ and UTF-16 KML are not supported, and the Norway/Svalbard UTM zone exceptions are ignored.

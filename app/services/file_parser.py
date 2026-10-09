@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import math
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -19,6 +20,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from pyproj import CRS
+from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
 
 from app.core.exceptions import CorruptFileError
@@ -30,6 +32,10 @@ logger = logging.getLogger(__name__)
 fiona.drvsupport.supported_drivers["KML"] = "rw"
 
 _COPY_CHUNK = 1024 * 1024
+
+
+class _UnopenableLayerName(Exception):
+    """A KML layer listed by Fiona cannot be opened by that name (GDAL >= 3.10); read the file by position."""
 
 
 class MissingCRSError(CorruptFileError):
@@ -85,14 +91,25 @@ def parse_geospatial_file(path: Path, extension: str, max_extracted_bytes: int, 
             sources = [(shp, None) for shp in shapefiles]
             features, warnings = _read_sources(sources, driver=None, default_crs=None)
     elif extension == ".kml":
-        layers = _list_kml_layers(path)
-        features, warnings = _read_sources([(path, layer) for layer in layers], driver="KML", default_crs=WGS84)
+        sources = [(path, layer) for layer in _list_kml_layers(path)]
+        try:
+            features, warnings = _read_sources(sources, driver="KML", default_crs=WGS84)
+        except _UnopenableLayerName:
+            # All-or-nothing: mixing name-based and position-based reads can return one layer twice and
+            # skip another, because on these GDAL versions the listed order is not Fiona's internal order.
+            logger.info("KML layer names not openable; reading every layer by position")
+            features, warnings = _read_sources(sources, driver="KML", default_crs=WGS84, by_position=True)
     else:  # pragma: no cover - validated upstream
         raise CorruptFileError(f"Unsupported file extension: {extension}")
 
     if not features:
         detail = " " + " ".join(warnings) if warnings else ""
         raise CorruptFileError(f"The file contains no readable features.{detail}")
+
+    if extension == ".kml":
+        unusable, nulled = _null_unparseable_points(features, path)
+        if unusable:
+            warnings.append(_unparseable_points_warning(unusable, nulled))
 
     unique_crs = {id(f.crs): f.crs for f in features}.values()  # one CRS object per source; avoids per-feature hashing
     labels = list(dict.fromkeys(crs_label(crs) for crs in unique_crs))
@@ -134,23 +151,23 @@ def _list_kml_layers(path: Path) -> list[str | None]:
 
 
 def _read_sources(
-    sources: list[tuple[Path, str | None]], driver: str | None, default_crs: CRS | None
+    sources: list[tuple[Path, str | None]], driver: str | None, default_crs: CRS | None, by_position: bool = False
 ) -> tuple[list[ParsedFeature], list[str]]:
     """Read every (path, layer) source and number features consecutively across them.
 
     A KML layer that cannot be read is skipped and reported in the returned warnings
     (the file is still processed); an unreadable Shapefile fails the whole file.
+
+    Raises:
+        _UnopenableLayerName: A KML layer cannot be opened by its listed name and ``by_position`` is off.
     """
     features: list[ParsedFeature] = []
     warnings: list[str] = []
-    for src_path, layer in sources:
+    for index, (src_path, layer) in enumerate(sources):
         try:
-            kwargs: dict[str, Any] = {"engine": "fiona"}
-            if driver:
-                kwargs["driver"] = driver
-            if layer is not None:
-                kwargs["layer"] = layer
-            gdf = gpd.read_file(src_path, **kwargs)
+            gdf = _read_layer(src_path, layer, index, driver, by_position)
+        except _UnopenableLayerName:
+            raise
         except Exception as exc:  # noqa: BLE001 - Fiona/pyogrio/GDAL raise many unrelated types
             logger.warning(
                 "Failed to read geospatial source",
@@ -172,6 +189,44 @@ def _read_sources(
             )
         features.extend(_to_features(gdf, crs, start_index=len(features)))
     return features, warnings
+
+
+def _read_layer(path: Path, layer: str | None, index: int, driver: str | None, by_position: bool) -> gpd.GeoDataFrame:
+    """Read one layer with Fiona.
+
+    A KML whose placemarks sit directly under ``<Document>`` (no ``<Folder>``), or whose folders have
+    no ``<name>``, gets auto-generated layer names. With GDAL >= 3.10 those names, as returned by
+    ``fiona.listlayers``, are rejected by ``fiona.open`` with ``ValueError: Null layer``, so every
+    such KML failed. (GDAL 3.9 accepted them, which is why it only showed up on the arm64 Docker image.)
+
+    Reading by position works on every GDAL version, but Fiona cannot open layer ``0`` by index (it is
+    treated as "no layer given"), so position 0 is read without a layer argument, which Fiona resolves
+    to its first layer. The listed order is not always Fiona's internal order, so positions must be
+    used for *every* layer of a file or for none: see :func:`parse_geospatial_file`.
+
+    Args:
+        path: File to read.
+        layer: Layer name as listed by Fiona, or ``None`` to read the default layer.
+        index: Position of ``layer`` among the file's layers.
+        driver: Fiona driver name (``"KML"``) or ``None`` to auto-detect (Shapefile).
+        by_position: Read by position instead of by name.
+
+    Raises:
+        _UnopenableLayerName: The name cannot be opened (KML only, and only when ``by_position`` is off).
+    """
+    kwargs: dict[str, Any] = {"engine": "fiona"}
+    if driver:
+        kwargs["driver"] = driver
+    if layer is None or (by_position and index == 0):
+        return gpd.read_file(path, **kwargs)
+    if by_position:
+        return gpd.read_file(path, layer=index, **kwargs)
+    try:
+        return gpd.read_file(path, layer=layer, **kwargs)
+    except ValueError as exc:
+        if driver == "KML" and "Null layer" in str(exc):
+            raise _UnopenableLayerName(layer) from exc
+        raise
 
 
 def _to_features(gdf: gpd.GeoDataFrame, crs: CRS, start_index: int) -> list[ParsedFeature]:
@@ -268,3 +323,112 @@ def _safe_extract_zip(zip_path: Path, dest: Path, max_total_bytes: int, max_memb
                         out.write(chunk)
             except (zipfile.BadZipFile, RuntimeError, EOFError, OSError) as exc:
                 raise CorruptFileError("The ZIP archive is corrupt and could not be extracted.") from exc
+
+
+# ------------------------------------------------------------------ unparseable KML coordinates
+
+
+def _local(tag: str) -> str:
+    """Tag name without its XML namespace."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _norm(text: object) -> str:
+    """Normalise a name/description for matching: ``None`` -> ``""`` and whitespace collapsed."""
+    return " ".join(str(text).split()) if text else ""
+
+
+def _child_text(element: ET.Element, name: str) -> str:
+    for child in element:
+        if _local(child.tag) == name:
+            return child.text or ""
+    return ""
+
+
+def _point_is_unusable(point: ET.Element) -> bool:
+    """True if a KML ``<Point>`` has no usable longitude/latitude.
+
+    GDAL turns a Point with empty, missing or non-numeric coordinates into ``POINT (0 0)`` (or, for
+    ``77,abc``, into ``POINT (77 0)``) instead of reporting an error. An unusable altitude is
+    harmless (the geometry is used as 2D) and does not count.
+    """
+    coords = next((c for c in point if _local(c.tag) == "coordinates"), None)
+    tokens = (coords.text or "").split() if coords is not None else []
+    if not tokens:
+        return True
+    parts = tokens[0].split(",")
+    if len(parts) < 2:
+        return True
+    try:
+        return not (math.isfinite(float(parts[0])) and math.isfinite(float(parts[1])))
+    except ValueError:
+        return True
+
+
+def _scan_kml_points(path: Path) -> dict[tuple[str, str], list[bool]]:
+    """Stream the KML once and record, per ``(name, description)``, whether each ``<Point>`` placemark is unusable.
+
+    Entries are in document order. Only placemarks whose geometry is a plain ``<Point>`` are recorded.
+    The file has already been parsed successfully by GDAL, so a parse error here just disables the check.
+    """
+    flags: dict[tuple[str, str], list[bool]] = {}
+    try:
+        for _, element in ET.iterparse(path, events=("end",)):
+            if _local(element.tag) != "Placemark":
+                continue
+            point = next((c for c in element if _local(c.tag) == "Point"), None)
+            if point is not None:
+                key = (_norm(_child_text(element, "name")), _norm(_child_text(element, "description")))
+                flags.setdefault(key, []).append(_point_is_unusable(point))
+            element.clear()  # keep memory flat on large files
+    except ET.ParseError:
+        logger.warning("Could not scan KML for unparseable coordinates", exc_info=True)
+        return {}
+    return flags
+
+
+def _null_unparseable_points(features: list[ParsedFeature], path: Path) -> tuple[int, int]:
+    """Replace the invented geometry of KML Points with unusable coordinates by a null geometry.
+
+    GDAL cannot tell us which points it invented, and a genuine ``0,0`` point looks identical, so
+    the raw XML is scanned for Points with unusable coordinates and matched to the parsed features by
+    ``(name, description)`` and order. A match is only acted on if the parsed point really has a
+    zero coordinate (which is what GDAL produces for bad input), so a good point that merely shares
+    a name with a bad one is never nulled.
+
+    Returns:
+        ``(unusable, nulled)``: how many Points had unusable coordinates, and how many of them could
+        be matched to a feature and were set to a null geometry.
+    """
+    flags = _scan_kml_points(path)
+    unusable = sum(sum(entries) for entries in flags.values())
+    if not unusable:
+        return 0, 0
+
+    nulled = 0
+    for feature in features:
+        if feature.geometry_type != "Point" or feature.geometry is None:
+            continue
+        key = (_norm(feature.properties.get("Name")), _norm(feature.properties.get("Description")))
+        entries = flags.get(key)
+        if not entries:
+            continue
+        is_unusable = entries.pop(0)
+        geometry = feature.geometry
+        if is_unusable and isinstance(geometry, Point) and (geometry.x == 0 or geometry.y == 0):
+            feature.geometry, feature.wkt = None, None
+            nulled += 1
+    if nulled:
+        logger.warning("Nulled KML points with unparseable coordinates", extra={"count": nulled, "unusable": unusable})
+    return unusable, nulled
+
+
+def _unparseable_points_warning(unusable: int, nulled: int) -> str:
+    """User-facing warning for KML points with empty or unparseable coordinates."""
+    noun = "feature" if unusable == 1 else "features"
+    if nulled == unusable:
+        return f"{unusable} {noun} had empty or unparseable coordinates; the geometry of {'it was' if unusable == 1 else 'each was'} set to null."
+    return (
+        f"{unusable} {noun} had empty or unparseable coordinates. {nulled} had their geometry set to null; "
+        f"{unusable - nulled} could not be matched to a feature and may be placed at (0, 0)."
+    )
