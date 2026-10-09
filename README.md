@@ -55,7 +55,7 @@ CORS is open (`*`) when `ENVIRONMENT=development`, so this works without configu
 ### Tests
 
 ```bash
-pytest                      # 122 backend tests, no Postgres needed
+pytest                      # 157 backend tests, no Postgres needed
 cd frontend && npm run build && npm run lint
 ```
 
@@ -129,7 +129,7 @@ curl http://localhost:8000/api/files/8e4bcba8-dfcc-4609-b116-718620bb14b3/
 {"status": "FAILED", "feature_count": null, "crs": null, "error": "'sf.shp' does not declare a coordinate reference system (missing .prj). Include the .prj file in the ZIP.", "warnings": []}
 ```
 
-`warnings` is for partial reads. If one folder of a multi-folder KML can't be parsed, the file still completes, and the skipped folder is named here, for example `["KML layer 'Roads' could not be read and was skipped; its features are missing."]`. A KML point whose coordinates are empty or unparseable is kept as a feature with a null geometry, and the file gets a warning that says how many: `["2 features had empty or unparseable coordinates; the geometry of each was set to null."]`. GDAL would otherwise turn such a point into `POINT (0 0)` without saying anything. An unknown id is `404 FILE_NOT_FOUND`; a malformed id is `422 VALIDATION_ERROR`.
+`warnings` is for partial reads. If one folder of a multi-folder KML can't be parsed, the file still completes, and the skipped folder is named here, for example `["KML layer 'Roads' could not be read and was skipped; its features are missing."]`. A KML point whose coordinates are empty or unparseable is kept as a feature with a null geometry, and the file gets a warning that says how many: `["2 features had empty or unparseable coordinates; the geometry of each was set to null."]`. GDAL would otherwise turn such a point into `POINT (0 0)` without saying anything. A geometry that can't be built at all, such as a LineString with a single point, is treated the same way: the feature is kept with a null geometry and a warning names it, for example `["Feature 3: LineString has fewer than 2 points — skipped (geometry set to null)"]`, and the rest of the layer still processes. Those per-feature geometry warnings are capped at 10 per file; anything beyond that is summarised in one line (`"...and 15 more features had geometries that could not be built."`). An unknown id is `404 FILE_NOT_FOUND`; a malformed id is `422 VALIDATION_ERROR`.
 
 ### GET /api/files/
 
