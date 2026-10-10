@@ -4,6 +4,19 @@ Upload a Shapefile (`.zip`) or KML and get the area (m²) of every polygon and t
 
 Repo: <https://github.com/shivam-tamboli/geospatial-measurement-api>
 
+## Architecture
+
+```mermaid
+flowchart LR
+    Client-->|upload file|FastAPI
+    FastAPI-->|save temp file|Disk
+    FastAPI-->|trigger|Background
+    Background-->|parse with GeoPandas|Disk
+    Background-->|save measurements|PostgreSQL
+    Client-->|query results|FastAPI
+    FastAPI-->|read measurements|PostgreSQL
+```
+
 ## Live URL
 
 <https://geospatial-measurement-api-zthu.onrender.com> (Swagger at `/docs`; `render.yaml` uses the free plan, so the first request after idle can be slow)
