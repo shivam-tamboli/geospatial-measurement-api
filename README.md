@@ -69,6 +69,19 @@ flowchart LR
 - **CRS:** per feature, centroid → UTM zone (`floor((lon + 180) / 6) + 1`, EPSG 326xx/327xx; UPS beyond 84°N/80°S) → reproject → measure. Always reprojected, even if already projected (it may be in feet). Features are grouped by zone: one PROJ call per zone per batch. `crs` is `EPSG:<code>` only on an exact match, otherwise `CUSTOM:<WKT prefix>`. A Shapefile without `.prj` fails rather than guessing. UTM is conformal, not equal-area, so features spanning several zones are less accurate.
 - **Data:** `uploaded_files` and `features` (properties and GeoJSON as JSONB). Measurements and GeoJSON are computed once at ingest and stored.
 
+### Measurement flow
+
+```mermaid
+flowchart LR
+    F[Feature] --> G{Geometry type}
+    G -->|Point| N[null]
+    G -->|Polygon / Line| C[Centroid]
+    G -->|Other, empty, invalid| N
+    C --> Z[UTM zone from longitude]
+    Z --> R[Reproject to metres]
+    R --> M[Area m² or length m]
+```
+
 ## Design decisions
 
 - FastAPI over Django/DRF: async I/O (parsing runs in a worker thread) and OpenAPI for free; no spatial queries, so GeoDjango/PostGIS isn't needed.
