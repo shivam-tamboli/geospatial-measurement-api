@@ -68,6 +68,7 @@ curl "localhost:8000/api/files/8e4bcba8-…/measurements/?page_size=1"
 - `202 Accepted` over `201`: nothing is measured yet.
 - SQLite for tests, Postgres in production: fast and hermetic, but blind to Postgres-only problems (CI against Postgres is future scope).
 - Frontend served by FastAPI at `/` rather than deployed separately on Vercel — single origin eliminates CORS, one deployment pipeline, no split infrastructure for what is effectively an internal tool.
+- File storage: Uploaded files are retained on local disk after processing (see Known Limitations); only extracted measurements are queried via the API. At production scale, files would be streamed directly to object storage (Cloudflare R2 or S3) before parsing, keeping server disk usage near zero and enabling horizontal scaling.
 
 ## Known limitations
 
